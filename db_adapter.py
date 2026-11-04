@@ -104,6 +104,7 @@ def _init_local_db():
         requires_target BOOLEAN DEFAULT 0,
         result_type TEXT DEFAULT 'COUNT',
         template_sql TEXT,
+        default_threshold REAL DEFAULT 0,
         is_active BOOLEAN DEFAULT 1
     )
     """)
@@ -300,9 +301,9 @@ def _init_local_db():
         # Rule Templates
         for name, data in RULE_TEMPLATES.items():
             cur.execute("""
-            INSERT INTO dq_rule_templates (template_name, category, description, requires_column, requires_target, result_type, template_sql, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-            """, (name, data["category"], data["description"], data["requires_column"], data["requires_target"], data["result_type"], data["sql_template"]))
+            INSERT INTO dq_rule_templates (template_name, category, description, requires_column, requires_target, result_type, template_sql, default_threshold, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+            """, (name, data["category"], data["description"], data["requires_column"], data["requires_target"], data["result_type"], data["sql_template"], data.get("default_threshold", 0)))
 
         # Configured Rules
         rules = [
@@ -473,23 +474,46 @@ def log_config_audit(entity_type: str, entity_id: str, action: str,
     
     # Convert numpy/pandas types to native Python types for JSON serialization
     def safe_serialize(val):
+        import numpy as np
+        
         if val is None:
             return None
+        
+        # Handle numpy integer types
+        if isinstance(val, (np.integer, int)):
+            return str(int(val))
+        
+        # Handle numpy float types
+        if isinstance(val, (np.floating, float)):
+            return str(float(val))
+        
+        # Handle boolean
+        if isinstance(val, (bool, np.bool_)):
+            return "true" if val else "false"
+        
+        # Handle dict/list - convert to JSON string with numpy support
         if isinstance(val, (dict, list)):
-            # Handle pandas/numpy in dict/list
             try:
-                return json.dumps(val)
+                # Pre-convert numpy types in nested structures
+                def convert_for_json(obj):
+                    if isinstance(obj, np.integer):
+                        return int(obj)
+                    elif isinstance(obj, np.floating):
+                        return float(obj)
+                    elif isinstance(obj, np.bool_):
+                        return bool(obj)
+                    elif isinstance(obj, dict):
+                        return {k: convert_for_json(v) for k, v in obj.items()}
+                    elif isinstance(obj, (list, tuple)):
+                        return [convert_for_json(item) for item in obj]
+                    return obj
+                
+                converted = convert_for_json(val)
+                return json.dumps(converted)
             except (TypeError, ValueError):
                 return str(val)
-        # Handle numpy/pandas scalars
-        try:
-            import numpy as np
-            if isinstance(val, (np.integer, np.int64)):
-                return str(int(val))
-            if isinstance(val, (np.floating, np.float64)):
-                return str(float(val))
-        except:
-            pass
+        
+        # Default: convert to string
         return str(val)
     
     old_str = safe_serialize(old_value)
@@ -1341,7 +1365,7 @@ def get_rule_templates() -> pd.DataFrame:
     """Returns all active rule templates from dq_rule_templates."""
     return query_df("""
     SELECT template_id, template_name, category, description, requires_column, requires_target, 
-           result_type, template_sql, is_active
+           result_type, template_sql, default_threshold, is_active
     FROM dq_rule_templates
     WHERE is_active = 1
     ORDER BY template_name

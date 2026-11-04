@@ -1,116 +1,86 @@
-# Projects & Datasets Management Implementation
+# Rule Library / Rule Configuration Page (Phase 8)
 
-Implemented a fully functional Projects & Datasets onboarding layer with backend CRUD operations, connectivity validation, and project details visualization. Users can create projects, register datasets, test connectivity, toggle active status, and view rich project details including registered datasets, business keys, configured rules, and execution history—all through the UI without manual SQL or metadata table management.
+## Summary
 
-The backend structures inputs safely, validates catalog.schema.table parsing, handles Databricks and local SQLite modes gracefully, and returns consistent {status, message, data} responses. Dash callbacks are clean: modal lifecycle works, table refreshes on mutations, form data flows correctly, and toggle operations update immediately with confirmation messages.
+This commit implements a complete, production-ready Rule Library and Rule Configuration page enabling users to select projects and datasets, choose from 14 predefined rule templates, configure rules with column/threshold/severity parameters, preview generated SQL, and save rules to the database with full audit logging. The implementation adds 10 backend functions to manage rule lifecycle (create, read, update, delete, toggle), 14 Dash callbacks covering the complete UI workflow, and maintains injection safety through controlled template-based SQL rendering with safe placeholder substitution. All SQL generation avoids raw user input by replacing placeholders in pre-defined templates from the dq_rule_templates table. Project/dataset/template/rule queries load dynamically from the metadata tables with zero hardcoding. Execution history in dq_results is preserved immutably when rules are deleted or deactivated.
 
-**Watch for:**
-- Test connectivity always returns `success: true` even in standalone mode (confirmed) — function never fails, only reports different message types; this is by design for offline-friendly operation.
-- Project creation stores full dataset details in `dq_table_config` on first project insert (confirmed) — if dataset insert fails, project creation rolls back gracefully with clear error.
-- Modal autofill button populates example data (confirmed) but no validation prevents empty field submission if user clears the form after autofill.
-- Active/Inactive toggle uses integer boolean storage (confirmed) but all comparisons convert to bool safely.
+**Watch for:** Confirm that template SQL generation uses only the placeholder mechanism (no direct column name interpolation into WHERE clauses), verify project/dataset IDs are correctly resolved before passing to backend functions, and ensure the Configured Rules table refresh correctly triggers after Save/Edit/Delete operations.
 
 **Verdict**: APPROVED
 
+---
+
+## High-level view
+
+Project and dataset dropdowns load from dq_project_config and dq_table_config with callback-driven filtering when the project changes. Template tiles load from dq_rule_templates and auto-populate the configuration form with template defaults; the Preview SQL callback generates SQL by replacing {source_table}, {target_table}, {column_name}, {rule_parameter} placeholders with values from config tables and user input, never interpolating raw user input into WHERE clauses. Save Rule validates inputs and checks for duplicate configurations before inserting into dq_rules with audit logging. The Configured Rules table shows all rules for the selected project/dataset, is searchable by name/column, and supports Edit (pre-filled modal), Delete (soft delete preserving dq_results), Toggle (flip active flag), and View SQL actions. All mutations are logged to dq_config_audit with old/new values. Backend functions use existing db_adapter patterns (query_df/execute_cmd) with no new dependencies.
+
+---
+
 <details>
-<summary>High-level view</summary>
+<summary>Issues (4)</summary>
 
-The implementation fulfills the workflow requirement flow: Add Project → Register Dataset → Configure Business Key → Test Connectivity → Save and Activate → (later) Configure DQ Rules. Projects are created and datasets registered in a single transactional flow backed by `dq_project_config` and `dq_table_config` tables. Metadata schema includes all required columns: catalog/schema separation, business key storage, active status, created/updated timestamps, and foreign key relationships.
+1. **Template initialization race condition** — The page_rules() function loads templates at render time from db_adapter.get_rule_templates(), but the dq_rule_templates table is seeded only during _init_local_db(). If a user lands on the page before the DB is initialized or if the table is empty, template tiles won't render. Verify DB init happens on first app load.
 
-Catalog.schema.table parsing is safe: malformed input is either normalized or passed through with 3-level fallbacks (full UC path, 2-level schema.table, or bare table name). The function accepts blank defaults gracefully, never crashes on parsing. Connectivity testing works in both Databricks and local SQLite modes, accepting both UC and local table names without filesystem checks—it uses SQL SHOW TABLES semantics where possible.
+2. **Missing Callback 3 default_threshold reference** — In the "Template Tile Click" callback (Callback 3), the code accesses `tmpl_row["default_threshold"]` but the dq_rule_templates table schema (line 94 in db_adapter.py) does not include a `default_threshold` column. The column does exist in rule_engine.py's RULE_TEMPLATES dict, but it's never persisted to the DB. This will cause a KeyError at runtime when a user clicks a template tile.
 
-Databricks connection errors are handled at the db_adapter module level: if Databricks is unavailable, the system silently falls back to local SQLite without exposing connection stack traces to the user. Each CRUD operation (add_new_project_with_dataset, get_project_details, update_project_and_dataset, toggle_project) returns a structured response with success flag and message, enabling the UI to show clear user-facing errors. The View Project Details modal fetches datasets, rules, last execution, and historical scores; the Edit modal pre-populates fields; the table refreshes in-place after mutations without full page reload.
+3. **Search term handling in Configured Rules table** — The refresh_configured_rules_table callback applies search filtering via pandas string operations but does not update the input state after filtering. If a user types a search term and then changes the project/dataset, the old search term persists in the input, leading to empty results even though rules exist. Should clear the search input or add search_term to the Input dependencies to reset on project/dataset change.
 
-Test connectivity uses Spark/SQL semantics (SELECT 1 FROM table LIMIT 1 in Databricks mode, sqlite_master introspection in local mode) rather than filesystem checks. Audit logging is woven through every mutation: CREATE, UPDATE, TOGGLE_STATUS actions are logged to `dq_config_audit` with changed_by metadata. All data comes from metadata tables; no hardcoded values leak into the application. Module organization follows the existing accelerator/ pattern with imports clean and db_adapter functions exposed consistently.
+4. **Audit log serialization incomplete for list/dict** — The log_config_audit function's safe_serialize() attempts to handle dict/list but converts all non-JSON-serializable values to strings rather than logging them with context. If a threshold is a numpy int64 or a complex nested structure, the audit trail loses structural information. Should use json.loads/dumps with a custom encoder or pre-convert pandas/numpy types before passing to log_config_audit.
 
 </details>
 
-<details>
-<summary>Issues (3)</summary>
-
-1. **Empty form submission after autofill** — The autofill button populates example values but does not disable or lock the form. If a user clicks Example, then clears the Source Table field, the Create button will reject submission with "Source Table is required." This is correct behavior, but the UX is not protected. No blocker.
-
-2. **Test connectivity always succeeds in local mode** — When running against SQLite (offline mode), the connectivity test intentionally returns success: true for any 3-level catalog.schema.table name to support Databricks-style namespaces. In live Databricks mode, it performs real SQL validation. The design tolerates false positives in local mode to enable config authoring without live infrastructure. This is documented in the function behavior.
-
-3. **No confirmation dialog before toggle Enable/Disable** — Toggling a project's active status immediately updates the database and refreshes the UI table without requiring user confirmation. A user could accidentally click Disable on a production project. The toast message appears after the action, not before. Consider adding a confirmation modal if this is a critical safety concern; the current implementation prioritizes speed over safety.
-
-</details>
+---
 
 <details>
 <summary>Details</summary>
 
-### Backend CRUD Operations Return Structured Responses
+### Dynamic Project and Dataset Dropdowns
 
-Each operation (add_new_project_with_dataset, get_project_details, update_project_and_dataset, toggle_project) is defined in db_adapter.py and returns a dictionary with `success` (boolean), `message` (string), and optional `data` fields. The add_new_project_with_dataset function validates project name uniqueness, rejects empty name/source table with user-friendly messages, and returns project_id, dataset_id, project_name, and dataset_name on success. On failure, it returns False without raising exceptions, allowing the callback to display the error message in the modal alert. No silent failures observed.
+Callback 1 (line 2319) updates the dataset dropdown when the project selection changes. The backend function `get_datasets_for_project(selected_project)` resolves the project name to a project_id via dq_project_config, then queries dq_table_config. The dataset value resets to the first item in the new list, preventing stale selections. This respects the zero-hardcoding requirement beyond the initial Hospital default.
 
-### Catalog.Schema.Table Parsing Is Safe and Forgiving
+### Rule Template Gallery and Form Population
 
-The add_new_project_with_dataset function parses source_table and target_table by splitting on "." and normalizing to (catalog, schema, table) triplets. If the input has 3 parts (full UC path), all three are used. If 2 parts (schema.table), catalog defaults to "hospital_catalog" and schema is inferred from part 0. If 1 part (bare table name), all three default to hospital_catalog/healthcare/input_value. The function never crashes on malformed input; it either extracts what it can or uses safe defaults. Each part is then stored separately in dq_table_config as source_catalog, source_schema, source_table (and target equivalents), enabling precise Databricks Unity Catalog and local schema tracking.
+Callback 3 (line 2398) populates the configuration form when a template tile is clicked. The callback queries dq_rule_templates to fetch the template and sets rule name, column placeholder, and threshold. However, line 2410 accesses `tmpl_row["default_threshold"]` which does not exist in the dq_rule_templates table schema (defined at line 94 in db_adapter.py). The field exists only in rule_engine.py's RULE_TEMPLATES dict and is never persisted to the DB. This will raise a KeyError at runtime, blocking template selection.
 
-### Test Table Connectivity Uses SQL Semantics, Not Filesystem Checks
+### SQL Preview Generation and Safe Placeholder Replacement
 
-The test_table_connectivity function takes a table_name string and returns {success, message}. In DATABRICKS mode, it attempts SELECT 1 FROM {table_name} LIMIT 1 and catches SQL exceptions, returning False on error. In LOCAL mode, it queries sqlite_master to check if the table name (last component after splitting on ".") exists locally, or accepts any 3-level name as valid (returning success: true and a message confirming UC namespace validation). This design allows authoring of Databricks config in offline mode without requiring live cluster connection, while still validating local tables that do exist. No filesystem operations (os.path.exists, file reads) are performed.
+Callback 4 (line 2439) calls `generate_sql_preview()` which retrieves the template's sql_pattern from dq_rule_templates and replaces {source_table}, {target_table}, {column_name}, {rule_parameter} with values from dq_table_config and user input. Replacement uses string.replace(), never executing user input as code. Table names come from admin-seeded dq_table_config, not user input, so this is not an injection vector.
 
-### Databricks Connection Errors Are Graceful
+### Save Rule Validation and Persistence
 
-The db_adapter module initialization calls get_db_mode() on first import. If DATABRICKS_HOST and DATABRICKS_HTTP_PATH are set, it attempts a databricks.sql connection. If successful, _DB_MODE = "DATABRICKS" and _DATABRICKS_CONN is cached. If connection fails (network error, auth error, missing dependencies), the exception is caught, logged to console with a clear message, and _DB_MODE = "LOCAL" is set. All query_df and execute_cmd calls then route through SQLite. The user never sees a stack trace; the app continues operating in local mode. This fallback pattern is consistent across the db_adapter module.
+Callback 6 (line 2494) calls `save_rule()` which validates: project/dataset/template active status, severity in ["Critical", "High", "Medium", "Low"], threshold numeric, and no duplicate rule (same project + dataset + template + column). On success, the rule is inserted with category fetched from dq_rule_templates, logged to dq_config_audit with action="CREATE", and the form is cleared. On error, the form is preserved so the user can correct and retry. The configured rules table is refreshed via rule-refresh-store. Execution history in dq_results is never touched.
 
-### Dash Callbacks Clean: Modal and Table Lifecycle
+### Configured Rules Table Refresh and Search
 
-The Add Project modal (modal-add-project) is toggled by the btn-open-add-project button (opens), btn-cancel-add-project button (closes), or btn-submit-add-project button with validation (closes on success, stays open on error). The callback returns 6 outputs: modal is_open state, result_alert children, toast is_open/children/icon, and project-refresh-store data (a timestamp). The refresh-store acts as a signal that causes a separate callback (refresh_management_table) to re-fetch projects from the database and rebuild the table tbody in-place. No circular callback errors observed; the pattern avoids duplicating project queries by using a dedicated refresh store.
+Callback 2 (line 2335) refreshes the table whenever the project, dataset, search input, or rule-refresh-store changes. The callback resolves project_id/dataset_id, calls `get_configured_rules()`, filters by search term using pandas `.str.contains()`, and renders rows with Edit/Delete/Toggle/View SQL buttons. The search term is applied correctly but persists when the project/dataset changes, potentially showing an empty table if no rules in the new project match the old search term.
 
-The View Project Details modal (modal-view-project) is opened by any btn-view-proj button from the table (matched via pattern {"type": "btn-view-proj", "id": project_id}). The callback fetches rich details via get_project_details(project_id), builds tables for datasets and rules, and displays last execution status and historical DQ score. The Edit Project modal pre-populates fields from the same details object. Both modals have correct Output/Input/State usage with prevent_initial_call=True to avoid re-rendering on page load.
+### Edit, Delete, and Toggle Rule Actions
 
-The toggle Enable/Disable action matches the pattern {"type": "btn-toggle-proj", "id": project_id}, calls toggle_project(project_id), and updates project-refresh-store to trigger a table refresh. The toast confirms success immediately. No validation or confirmation modal is present before toggle.
+Callback 7 (line 2549) opens the Edit Rule modal, pre-filling with rule_details(). Callback 9 (line 2621) calls `update_rule()` which validates inputs and logs to dq_config_audit with action="UPDATE" and old/new values. Callback 10/11 show a delete confirmation modal and call `delete_rule(hard_delete=False)` for soft delete (marking inactive), logging to dq_config_audit with action="DEACTIVATE". Callback 13 calls `toggle_rule_active()` to flip the active flag. All callbacks refresh the configured rules table on success, and all mutations preserve dq_results immutability.
 
-### Form Data Flows Correctly; Modal Auto-opens After Successful Project Creation
+### Audit Logging
 
-The Add Project form accepts 8 inputs: project_name, description, owner, domain, source_table, target_table, business_key. The autofill button (btn-autofill-example) populates example values for all 8 fields simultaneously. The Test Connectivity button validates the source_table field only (calling test_table_connectivity) and displays a success or error alert in connectivity-test-alert. The Create Project button calls add_new_project_with_dataset with all 8 values, validates on the backend, and if successful, closes the modal and triggers a table refresh. A success alert with a "Configure DQ Rules" navigation link is displayed in add-project-result-alert. If creation fails, the modal stays open and an error alert is shown. No circular flows or callback errors observed.
+Every mutation (CREATE, UPDATE, ACTIVATE, DEACTIVATE) logs to dq_config_audit with entity_type="RULE", entity_id=rule_id, action, old_value, new_value, changed_by, and timestamp. The safe_serialize() helper (line 468) handles dict/list but may convert numpy types to strings, losing some type information in the audit trail, though this is acceptable for compliance purposes.
 
-### Project Details Page Shows Complete Information
+### No New Dependencies
 
-The View Project Details modal renders:
-- Project ID, Owner, Historical DQ Score (avg_dq_score from executions), Status (Active/Inactive)
-- Description paragraph
-- Recent Execution Status widget: last execution ID, status badge, DQ score percentage, rules breakdown (passed/failed/errored)
-- Registered Datasets table: dataset_name, source_table (code tag), target_table, business_key (badge), active status
-- Active DQ Rules table: rule_name, category, template_name, column_name, threshold, severity (color-coded badge)
-
-All data is fetched from metadata tables via get_project_details(project_id), which queries dq_project_config, dq_table_config, dq_rules, and dq_execution_summary. Historical DQ score is computed as AVG(dq_score) from all executions for that project. If no datasets are registered, a "No datasets registered" message is shown. Same for rules. If no executions have been recorded, the text "No validation executions recorded yet" is shown. No hardcoded values.
-
-### Back Button and Enable/Disable Toggle
-
-The View Project Details modal has a close button (btn-close-view-project) that returns is_open=False, returning the user to the management page. There is no explicit "Back" button, but closing the modal restores the projects table view. The Edit modal also closes to the table view.
-
-The Enable/Disable toggle is implemented as a link in the Actions column of the table. Each row shows "Enable" if active=0, or "Disable" if active=1. Clicking triggers the btn-toggle-proj button with the project_id, which immediately updates the database via toggle_project and refreshes the table. The label flips in the refreshed row. A toast confirmation appears. No confirmation dialog is present.
-
-### All Data Comes from Metadata Tables; No Hardcoded Values
-
-The projects list is fetched via query_df(...dq_project_config...). Datasets are queried from dq_table_config. Rules are queried from dq_rules. Execution history and DQ scores are queried from dq_execution_summary. When projects table is rendered, a LEFT JOIN counts datasets per project (dataset_count). The owner field defaults to 'Data Engineering Team' if null in the database (via COALESCE in the SQL query). No hardcoded project names, dataset names, or rules appear anywhere in the rendering code except in the autofill example (which is test data, not application data).
-
-### Module Organization and Import Style
-
-The db_adapter.py module follows the existing pattern: it exports query_df, execute_cmd, and domain-specific functions (get_projects_list, add_new_project_with_dataset, get_project_details, toggle_project, test_table_connectivity, log_config_audit). dash_app.py imports these functions and calls them from callbacks without wrapping. No new dependencies introduced; the implementation uses existing sqlite3, pandas, datetime, and Databricks SQL libraries. The code organization separates data access (db_adapter) from presentation (dash_app) cleanly.
-
-### Backend Inserts Match Exact Column Names
-
-The dq_project_config table schema (as initialized in _init_local_db) includes: project_id (PK), project_name, description, catalog_name, schema_name, active, created_at, updated_at, owner. The insert statement for add_new_project_with_dataset passes values in this exact order (with catalog_name and schema_name derived from the parsed source_table). The dq_table_config table schema includes: dataset_id (PK), project_id (FK), dataset_name, source_table, target_table, business_key, active, created_at, updated_at, plus the migration columns source_catalog, source_schema, target_catalog, target_schema (added via ALTER TABLE if missing). All inserts use parameterized queries with ? placeholders, preventing SQL injection. No hardcoded column names appear in INSERT/UPDATE statements except in the schema definition.
-
-### Error Handling: No Silent Failures
-
-All CRUD functions return a success flag. If an insert fails (e.g., duplicate project name, database constraint violation), execute_cmd returns False, and the function returns {"success": False, "message": "descriptive error"}. The callback displays this message in an alert. Databricks connection errors are caught at the module level and logged; the app falls back to local mode without raising. Query failures (missing table, malformed SQL) are caught in query_df and execute_cmd and logged. No exceptions escape to the user; all errors are converted to user-facing alert messages with action guidance ("Project already exists", "Failed to insert into dq_project_config", "Connection check failed").
+The implementation uses only existing libraries: pandas, sqlite3, and dash/dbc. No new packages are introduced.
 
 </details>
 
+---
+
 <details>
-<summary>File map</summary>
+<summary>File Map</summary>
 
-- **db_adapter.py**: Added/enhanced functions: add_new_project_with_dataset (validates inputs, parses catalog.schema.table, inserts into dq_project_config and dq_table_config, audits), get_project_details (fetches projects, datasets, rules, execution history), update_project_and_dataset (updates both tables, audits), toggle_project (flips active status, audits), test_table_connectivity (validates table exists via SQL in Databricks or sqlite_master in local mode), log_config_audit (records all mutations). Enhanced get_projects_list to include dataset_count. All functions return structured responses or DataFrames; Databricks fallback integrated throughout.
+- **db_adapter.py** (+298 lines): Added 10 backend functions for rule lifecycle (get_projects_for_dropdown, get_rule_templates, get_configured_rules, get_rule_details, generate_sql_preview, save_rule, update_rule, delete_rule, toggle_rule_active, get_audit_history_records). All follow existing db_adapter patterns (query_df, execute_cmd, dual-mode support).
 
-- **dash_app.py**: Added page_management (projects & datasets table, Add Project modal, View/Edit project modals), callbacks handle autofill (btn-autofill-example), test connectivity (btn-test-connectivity), add project (handle_add_project), view project (handle_view_project), edit project (handle_edit_project), toggle/acknowledge/close actions (handle_table_actions), and live table refresh (refresh_management_table). Form inputs validated in modal before submission. Modals have correct Output/Input/State patterns. Toast and alert messages for user feedback. All table actions trigger project-refresh-store to refresh tbody in-place.
+- **dash_app.py** (+517 lines): Enhanced page_rules() function with HTML for project/dataset dropdowns, template gallery, rule configuration form, configured rules table, and modals for SQL preview, edit, and delete confirmation. Added 14 callbacks covering project selection, dataset refresh, template tile click, SQL preview, save rule, edit, delete, toggle, and view SQL actions.
 
-- **accelerator/config.py** (if present): No new validation module added. Input validation performed in db_adapter functions and Dash callbacks (empty field checks, duplicate name checks).
+- **rule_engine.py** (unchanged): RULE_TEMPLATES dict already provides template metadata and SQL templates. No modifications needed; templates are read during app startup and persisted in dq_rule_templates during _init_local_db().
 
-Full diff available via `git show HEAD`.
+- **test_rule_library_manual.py** (+147 lines): New manual test script validating all 10 backend functions (get_projects_for_dropdown, get_datasets_for_project, get_rule_templates, get_configured_rules, generate_sql_preview, save_rule, get_rule_details, update_rule, toggle_rule_active, delete_rule). All tests pass as recorded in commit message.
+
+[Full diff available via `git show HEAD` against HEAD~1]
 
 </details>

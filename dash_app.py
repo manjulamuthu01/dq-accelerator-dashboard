@@ -2330,6 +2330,17 @@ def update_dataset_dropdown(selected_project):
     value = datasets[0] if datasets else None
     return options, value
 
+# Callback 1.5: Clear search input when project/dataset changes
+@app.callback(
+    Output("input-search-rules", "value"),
+    [Input("rule-select-project", "value"),
+     Input("rule-select-dataset", "value")],
+    prevent_initial_call=False,
+)
+def clear_search_on_project_dataset_change(proj_name, ds_name):
+    """Clear search input to avoid stale search results when switching projects/datasets."""
+    return ""
+
 # Callback 2: Project/Dataset Selection → Refresh Configured Rules Table
 @app.callback(
     Output("configured-rules-table-body", "children"),

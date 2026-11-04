@@ -1,0 +1,72 @@
+{
+  "name": "Dynamic-Data-Quality-Accelerator-Workflow",
+  "description": "Automated Dynamic Data Quality Validation and Reconciliation Workflow.",
+  "tasks": [
+    {
+      "task_key": "dq_orchestrator",
+      "description": "Executes generic DQ rule validations for active datasets.",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Shared/dq-accelerator/dq_orchestrator_job",
+        "source": "WORKSPACE",
+        "base_parameters": {
+          "project_name": "{{job.parameters.project_name}}",
+          "dataset_name": "{{job.parameters.dataset_name}}",
+          "skip_recon_on_dq_fail": "{{job.parameters.skip_recon_on_dq_fail}}"
+        }
+      },
+      "max_retries": 2,
+      "min_retry_interval_millis": 60000,
+      "retry_on_timeout": true,
+      "timeout_seconds": 3600
+    },
+    {
+      "task_key": "dq_reconciliation",
+      "depends_on": [
+        {
+          "task_key": "dq_orchestrator"
+        }
+      ],
+      "run_if": "ALL_SUCCESS",
+      "description": "Executes source-to-target reconciliation checks across datasets after successful validation.",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Shared/dq-accelerator/dq_reconciliation_job",
+        "source": "WORKSPACE",
+        "base_parameters": {
+          "project_name": "{{job.parameters.project_name}}",
+          "dataset_name": "{{job.parameters.dataset_name}}",
+          "execution_id": "{{tasks.dq_orchestrator.values.execution_id}}"
+        }
+      },
+      "max_retries": 2,
+      "min_retry_interval_millis": 60000,
+      "retry_on_timeout": true,
+      "timeout_seconds": 3600
+    }
+  ],
+  "parameters": [
+    {
+      "name": "project_name",
+      "default": "all"
+    },
+    {
+      "name": "dataset_name",
+      "default": "all"
+    },
+    {
+      "name": "skip_recon_on_dq_fail",
+      "default": "false"
+    }
+  ],
+  "schedule": {
+    "quartz_cron_expression": "0 0 6 * * ?",
+    "timezone_id": "UTC",
+    "pause_status": "PAUSED"
+  },
+  "email_notifications": {
+    "on_failure": [
+      "dq-alerts@yourcompany.com"
+    ],
+    "no_alert_for_skipped_runs": true
+  },
+  "max_concurrent_runs": 1
+}

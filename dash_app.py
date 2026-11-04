@@ -898,7 +898,7 @@ def page_rules():
                     html.Div(t_name, style={"fontWeight": "600", "fontSize": "0.85rem", "color": "#0F172A"}),
                     html.Div(t_info["description"], style={"fontSize": "0.75rem", "color": "#64748B"}),
                 ]),
-            ], id={"type": "template-tile", "id": t_name}, className="template-tile", n_clicks=0)
+            ], id={"type": "template-tile", "index": t_name}, className="template-tile", n_clicks=0)
         )
 
     return html.Div([
@@ -987,6 +987,27 @@ def page_rules():
             ], lg=7, className="mb-4"),
         ], className="g-3"),
 
+        # Configured Rules Section
+        html.Div([
+            html.Div("Configured Rules", className="dq-card-title"),
+            dbc.InputGroup([
+                dbc.InputGroupText(html.I(className="bi bi-search")),
+                dbc.Input(id="input-search-rules", placeholder="Search rules...", type="text"),
+            ], className="mb-3"),
+            html.Table([
+                html.Thead(html.Tr([
+                    html.Th("Rule Name"),
+                    html.Th("Column"),
+                    html.Th("Threshold"),
+                    html.Th("Severity"),
+                    html.Th("Status"),
+                    html.Th("Created At"),
+                    html.Th("Actions"),
+                ])),
+                html.Tbody(id="configured-rules-table-body", children=[]),
+            ], className="clean-table"),
+        ], className="dq-card mt-4"),
+
         # Preview SQL Modal
         dbc.Modal([
             dbc.ModalHeader(dbc.ModalTitle("Generated SQL Template Preview")),
@@ -997,6 +1018,65 @@ def page_rules():
                 dbc.Button("Close", id="btn-close-sql-modal", color="secondary"),
             ]),
         ], id="modal-preview-sql", is_open=False),
+
+        # Edit Rule Modal
+        dbc.Modal([
+            dbc.ModalHeader(dbc.ModalTitle("Edit Rule")),
+            dbc.ModalBody([
+                dbc.Form([
+                    html.Div([
+                        dbc.Label("Rule Name", className="fw-semibold"),
+                        dbc.Input(id="edit-rule-name", type="text"),
+                    ], className="mb-3"),
+                    html.Div([
+                        dbc.Label("Column", className="fw-semibold"),
+                        dbc.Input(id="edit-rule-column", type="text"),
+                    ], className="mb-3"),
+                    html.Div([
+                        dbc.Label("Threshold", className="fw-semibold"),
+                        dbc.Input(id="edit-rule-threshold", type="text"),
+                    ], className="mb-3"),
+                    html.Div([
+                        dbc.Label("Severity", className="fw-semibold"),
+                        dbc.Select(
+                            id="edit-rule-severity",
+                            options=[
+                                {"label": "Critical", "value": "Critical"},
+                                {"label": "High", "value": "High"},
+                                {"label": "Medium", "value": "Medium"},
+                                {"label": "Low", "value": "Low"},
+                            ],
+                        ),
+                    ], className="mb-3"),
+                    html.Div([
+                        dbc.Label("Active", className="fw-semibold me-3"),
+                        dbc.Switch(id="edit-rule-switch-active", className="d-inline-block"),
+                    ], className="mb-3 d-flex align-items-center"),
+                ]),
+                dcc.Store(id="edit-rule-id", data=None),
+            ]),
+            dbc.ModalFooter([
+                dbc.Button("Cancel", id="btn-cancel-edit-rule", color="secondary"),
+                dbc.Button("Save", id="btn-submit-edit-rule", color="primary"),
+            ]),
+        ], id="modal-edit-rule", is_open=False),
+
+        # Delete Confirmation Modal
+        dbc.Modal([
+            dbc.ModalHeader(dbc.ModalTitle("Confirm Delete")),
+            dbc.ModalBody([
+                html.P("Are you sure you want to delete this rule? The execution history will be preserved."),
+            ]),
+            dbc.ModalFooter([
+                dbc.Button("Cancel", id="btn-cancel-delete-rule", color="secondary"),
+                dbc.Button("Delete", id="btn-confirm-delete-rule", color="danger"),
+            ]),
+        ], id="modal-delete-confirm", is_open=False),
+
+        # Hidden stores for tracking state
+        dcc.Store(id="delete-rule-id", data=None),
+        dcc.Store(id="current-template-name", data=None),
+        dcc.Store(id="rule-refresh-store", data=0),
     ])
 
 # -------------------------------------------------------------
@@ -1868,7 +1948,7 @@ def handle_view_project(view_clicks, close_click, is_open):
                 html.Td(d["dataset_name"], style={"fontWeight": "600"}),
                 html.Td(html.Code(d["source_table"])),
                 html.Td(html.Code(d["target_table"] or "—")),
-                html.Td(html.Badge(d["business_key"] or "id", color="secondary", className="px-2 py-1")),
+                html.Td(dbc.Badge(d["business_key"] or "id", color="secondary", className="px-2 py-1")),
                 html.Td(html.Span("Active", className="badge-active") if d["active"] else html.Span("Inactive", className="badge-inactive")),
             ]))
 
@@ -2229,6 +2309,439 @@ def handle_csv_downloads(results_click, alert_click, selected_report_click, sele
         fname = f"dq_{rtype.lower()}_report.csv"
         return dcc.send_data_frame(df.to_csv, fname, index=False)
     return None
+
+# =============================================================================
+# PHASE 8: RULE LIBRARY CALLBACKS
+# =============================================================================
+
+# Callback 1: Project Selection → Dataset Dropdown Refresh
+@app.callback(
+    [Output("rule-select-dataset", "options"),
+     Output("rule-select-dataset", "value")],
+    Input("rule-select-project", "value"),
+    prevent_initial_call=False,
+)
+def update_dataset_dropdown(selected_project):
+    if not selected_project:
+        return [], None
+    
+    datasets = db_adapter.get_datasets_for_project(selected_project)
+    options = [{"label": ds, "value": ds} for ds in datasets]
+    value = datasets[0] if datasets else None
+    return options, value
+
+# Callback 2: Project/Dataset Selection → Refresh Configured Rules Table
+@app.callback(
+    Output("configured-rules-table-body", "children"),
+    [Input("rule-select-project", "value"),
+     Input("rule-select-dataset", "value"),
+     Input("rule-refresh-store", "data"),
+     Input("input-search-rules", "value")],
+    prevent_initial_call=False,
+)
+def refresh_configured_rules_table(proj_name, ds_name, refresh_signal, search_term):
+    if not proj_name or not ds_name:
+        return []
+    
+    # Get project_id and dataset_id
+    proj_df = db_adapter.query_df(
+        "SELECT project_id FROM dq_project_config WHERE project_name = ?",
+        (proj_name,)
+    )
+    if proj_df.empty:
+        return []
+    
+    project_id = int(proj_df.iloc[0]["project_id"])
+    
+    ds_df = db_adapter.query_df(
+        "SELECT dataset_id FROM dq_table_config WHERE dataset_name = ? AND project_id = ?",
+        (ds_name, project_id)
+    )
+    if ds_df.empty:
+        return []
+    
+    dataset_id = int(ds_df.iloc[0]["dataset_id"])
+    
+    # Fetch rules
+    rules_df = db_adapter.get_configured_rules(project_id, dataset_id)
+    
+    # Filter by search term if provided
+    if search_term:
+        rules_df = rules_df[
+            (rules_df["rule_name"].str.contains(search_term, case=False, na=False)) |
+            (rules_df["column_name"].str.contains(search_term, case=False, na=False))
+        ]
+    
+    table_rows = []
+    for _, r in rules_df.iterrows():
+        rule_id = int(r["rule_id"])
+        active = bool(r["active"])
+        status_badge = "badge-pass" if active else "badge-inactive"
+        status_text = "Active" if active else "Inactive"
+        
+        table_rows.append(html.Tr([
+            html.Td(r["rule_name"], style={"fontWeight": "600"}),
+            html.Td(str(r["column_name"] or "-")),
+            html.Td(str(r["threshold"])),
+            html.Td(r["severity"]),
+            html.Td(html.Span(status_text, className=status_badge)),
+            html.Td(str(r["created_at"])),
+            html.Td([
+                dbc.Button("View SQL", id={"type": "btn-view-sql-rule", "index": rule_id}, size="sm", color="light", className="me-1", style={"fontSize": "0.75rem"}),
+                dbc.Button("Edit", id={"type": "btn-edit-rule", "index": rule_id}, size="sm", color="info", className="me-1", style={"fontSize": "0.75rem"}),
+                dbc.Button("Delete", id={"type": "btn-delete-rule", "index": rule_id}, size="sm", color="danger", className="me-1", style={"fontSize": "0.75rem"}),
+                dbc.Button("Toggle", id={"type": "btn-toggle-rule", "index": rule_id}, size="sm", color="warning", style={"fontSize": "0.75rem"}),
+            ], style={"whiteSpace": "nowrap"}),
+        ]))
+    
+    return table_rows if table_rows else [html.Tr([html.Td("No rules configured yet.", colSpan=7, className="text-center text-muted")])]
+
+# Callback 3: Template Tile Click → Populate Configuration Form
+@app.callback(
+    [Output("rule-input-name", "value"),
+     Output("rule-input-column", "placeholder"),
+     Output("rule-input-threshold", "value"),
+     Output("current-template-name", "data")],
+    Input({"type": "template-tile", "index": dash.ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def on_template_tile_click(n_clicks):
+    if not ctx.triggered:
+        return "NULL_COUNT", "Column name (required)", "0", "NULL_COUNT"
+    
+    trig = ctx.triggered_id
+    if not isinstance(trig, dict):
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    
+    template_name = trig.get("index")
+    if not template_name:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    
+    # Get template details
+    template_df = db_adapter.get_rule_templates()
+    tmpl = template_df[template_df["template_name"] == template_name]
+    
+    if tmpl.empty:
+        return template_name, "Column name", "0", template_name
+    
+    tmpl_row = tmpl.iloc[0]
+    requires_col = bool(tmpl_row["requires_column"])
+    default_threshold = tmpl_row["default_threshold"]
+    
+    col_placeholder = "Column name (required)" if requires_col else "Column name (optional)"
+    
+    return template_name, col_placeholder, str(default_threshold), template_name
+
+# Callback 4: Preview SQL Button → Show Modal with Generated SQL
+@app.callback(
+    [Output("modal-preview-sql", "is_open"),
+     Output("preview-sql-code", "children")],
+    Input("btn-preview-sql", "n_clicks"),
+    [State("rule-select-project", "value"),
+     State("rule-select-dataset", "value"),
+     State("current-template-name", "data"),
+     State("rule-input-column", "value")],
+    prevent_initial_call=True,
+)
+def show_preview_sql(n_clicks, proj_name, ds_name, template_name, column_name):
+    if not proj_name or not ds_name or not template_name:
+        return True, "-- Please select project, dataset, and template first"
+    
+    # Get IDs
+    proj_df = db_adapter.query_df(
+        "SELECT project_id FROM dq_project_config WHERE project_name = ?",
+        (proj_name,)
+    )
+    if proj_df.empty:
+        return True, "-- Project not found"
+    
+    project_id = int(proj_df.iloc[0]["project_id"])
+    
+    ds_df = db_adapter.query_df(
+        "SELECT dataset_id FROM dq_table_config WHERE dataset_name = ? AND project_id = ?",
+        (ds_name, project_id)
+    )
+    if ds_df.empty:
+        return True, "-- Dataset not found"
+    
+    dataset_id = int(ds_df.iloc[0]["dataset_id"])
+    
+    # Generate SQL
+    sql = db_adapter.generate_sql_preview(project_id, dataset_id, template_name, column_name)
+    
+    return True, sql
+
+# Callback 5: Close SQL Modal
+@app.callback(
+    Output("modal-preview-sql", "is_open"),
+    Input("btn-close-sql-modal", "n_clicks"),
+    State("modal-preview-sql", "is_open"),
+    prevent_initial_call=True,
+)
+def close_sql_modal(n_clicks, is_open):
+    return False
+
+# Callback 6: Save Rule Button → Validate, Insert, Show Toast, Refresh Table
+@app.callback(
+    [Output("global-toast", "is_open"),
+     Output("global-toast", "children"),
+     Output("rule-refresh-store", "data"),
+     Output("rule-input-name", "value"),
+     Output("rule-input-column", "value"),
+     Output("rule-input-threshold", "value"),
+     Output("rule-select-severity", "value"),
+     Output("rule-switch-active", "value")],
+    Input("btn-save-rule", "n_clicks"),
+    [State("rule-select-project", "value"),
+     State("rule-select-dataset", "value"),
+     State("current-template-name", "data"),
+     State("rule-input-name", "value"),
+     State("rule-input-column", "value"),
+     State("rule-input-threshold", "value"),
+     State("rule-select-severity", "value"),
+     State("rule-switch-active", "value")],
+    prevent_initial_call=True,
+)
+def handle_save_rule(n_clicks, proj_name, ds_name, template_name, rule_name, column_name, 
+                     threshold, severity, active):
+    # Validate inputs
+    if not proj_name or not ds_name or not template_name or not rule_name:
+        return True, dbc.Alert("All fields are required", color="danger"), dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    
+    # Get project and dataset IDs
+    proj_df = db_adapter.query_df(
+        "SELECT project_id FROM dq_project_config WHERE project_name = ?",
+        (proj_name,)
+    )
+    if proj_df.empty:
+        return True, dbc.Alert("Project not found", color="danger"), dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    
+    project_id = int(proj_df.iloc[0]["project_id"])
+    
+    ds_df = db_adapter.query_df(
+        "SELECT dataset_id FROM dq_table_config WHERE dataset_name = ? AND project_id = ?",
+        (ds_name, project_id)
+    )
+    if ds_df.empty:
+        return True, dbc.Alert("Dataset not found", color="danger"), dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    
+    dataset_id = int(ds_df.iloc[0]["dataset_id"])
+    
+    # Try to save the rule
+    try:
+        threshold = float(threshold)
+    except (ValueError, TypeError):
+        return True, dbc.Alert("Threshold must be numeric", color="danger"), dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    
+    result = db_adapter.save_rule(
+        project_id, dataset_id, template_name, rule_name, column_name, 
+        threshold, severity, active, user="admin"
+    )
+    
+    if result["success"]:
+        toast_msg = dbc.Alert(result["message"], color="success")
+        return True, toast_msg, datetime.now().timestamp(), "NULL_COUNT", "", "0", "High", True
+    else:
+        toast_msg = dbc.Alert(result["message"], color="danger")
+        return True, toast_msg, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+# Callback 7: Edit Button → Open Modal with Pre-filled Values
+@app.callback(
+    [Output("modal-edit-rule", "is_open"),
+     Output("edit-rule-id", "data"),
+     Output("edit-rule-name", "value"),
+     Output("edit-rule-column", "value"),
+     Output("edit-rule-threshold", "value"),
+     Output("edit-rule-severity", "value"),
+     Output("edit-rule-switch-active", "value")],
+    Input({"type": "btn-edit-rule", "index": dash.ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def open_edit_rule_modal(n_clicks):
+    if not ctx.triggered:
+        return False, None, "", "", "0", "High", True
+    
+    trig = ctx.triggered_id
+    if not isinstance(trig, dict):
+        return False, None, "", "", "0", "High", True
+    
+    rule_id = trig.get("index")
+    if not rule_id:
+        return False, None, "", "", "0", "High", True
+    
+    # Fetch rule details
+    rule_data = db_adapter.get_rule_details(rule_id)
+    
+    if "error" in rule_data:
+        return False, None, "", "", "0", "High", True
+    
+    return (
+        True,
+        rule_id,
+        rule_data["rule_name"],
+        rule_data["column_name"],
+        str(rule_data["threshold"]),
+        rule_data["severity"],
+        rule_data["active"]
+    )
+
+# Callback 8: Cancel Edit Modal
+@app.callback(
+    Output("modal-edit-rule", "is_open"),
+    Input("btn-cancel-edit-rule", "n_clicks"),
+    State("modal-edit-rule", "is_open"),
+    prevent_initial_call=True,
+)
+def close_edit_modal(n_clicks, is_open):
+    return False
+
+# Callback 9: Submit Edit Modal → Update Rule
+@app.callback(
+    [Output("modal-edit-rule", "is_open"),
+     Output("global-toast", "is_open"),
+     Output("global-toast", "children"),
+     Output("rule-refresh-store", "data")],
+    Input("btn-submit-edit-rule", "n_clicks"),
+    [State("edit-rule-id", "data"),
+     State("edit-rule-name", "value"),
+     State("edit-rule-column", "value"),
+     State("edit-rule-threshold", "value"),
+     State("edit-rule-severity", "value"),
+     State("edit-rule-switch-active", "value")],
+    prevent_initial_call=True,
+)
+def handle_update_rule(n_clicks, rule_id, rule_name, column_name, threshold, severity, active):
+    if not rule_id:
+        return False, True, dbc.Alert("Rule ID not found", color="danger"), dash.no_update
+    
+    try:
+        threshold = float(threshold)
+    except (ValueError, TypeError):
+        return True, True, dbc.Alert("Threshold must be numeric", color="danger"), dash.no_update
+    
+    result = db_adapter.update_rule(rule_id, rule_name, column_name, threshold, severity, active, user="admin")
+    
+    if result["success"]:
+        toast_msg = dbc.Alert(result["message"], color="success")
+        return False, True, toast_msg, datetime.now().timestamp()
+    else:
+        toast_msg = dbc.Alert(result["message"], color="danger")
+        return True, True, toast_msg, dash.no_update
+
+# Callback 10: Delete Button → Show Confirmation Modal
+@app.callback(
+    [Output("modal-delete-confirm", "is_open"),
+     Output("delete-rule-id", "data")],
+    Input({"type": "btn-delete-rule", "index": dash.ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def show_delete_confirm(n_clicks):
+    if not ctx.triggered:
+        return False, None
+    
+    trig = ctx.triggered_id
+    if not isinstance(trig, dict):
+        return False, None
+    
+    rule_id = trig.get("index")
+    return True, rule_id
+
+# Callback 11: Confirm Delete → Delete Rule & Refresh Table
+@app.callback(
+    [Output("modal-delete-confirm", "is_open"),
+     Output("global-toast", "is_open"),
+     Output("global-toast", "children"),
+     Output("rule-refresh-store", "data")],
+    Input("btn-confirm-delete-rule", "n_clicks"),
+    State("delete-rule-id", "data"),
+    prevent_initial_call=True,
+)
+def handle_delete_rule(n_clicks, rule_id):
+    if not rule_id:
+        return False, True, dbc.Alert("Rule ID not found", color="danger"), dash.no_update
+    
+    result = db_adapter.delete_rule(rule_id, user="admin", hard_delete=False)
+    
+    if result["success"]:
+        toast_msg = dbc.Alert(result["message"], color="success")
+        return False, True, toast_msg, datetime.now().timestamp()
+    else:
+        toast_msg = dbc.Alert(result["message"], color="danger")
+        return False, True, toast_msg, dash.no_update
+
+# Callback 12: Cancel Delete Modal
+@app.callback(
+    Output("modal-delete-confirm", "is_open"),
+    Input("btn-cancel-delete-rule", "n_clicks"),
+    State("modal-delete-confirm", "is_open"),
+    prevent_initial_call=True,
+)
+def close_delete_modal(n_clicks, is_open):
+    return False
+
+# Callback 13: Toggle Rule Active Status
+@app.callback(
+    [Output("global-toast", "is_open"),
+     Output("global-toast", "children"),
+     Output("rule-refresh-store", "data")],
+    Input({"type": "btn-toggle-rule", "index": dash.ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def handle_toggle_rule(n_clicks):
+    if not ctx.triggered:
+        return False, "", dash.no_update
+    
+    trig = ctx.triggered_id
+    if not isinstance(trig, dict):
+        return False, "", dash.no_update
+    
+    rule_id = trig.get("index")
+    if not rule_id:
+        return False, "", dash.no_update
+    
+    result = db_adapter.toggle_rule_active(rule_id, user="admin")
+    
+    if result["success"]:
+        toast_msg = dbc.Alert(result["message"], color="success")
+        return True, toast_msg, datetime.now().timestamp()
+    else:
+        toast_msg = dbc.Alert(result["message"], color="danger")
+        return True, toast_msg, dash.no_update
+
+# Callback 14: View SQL Rule Button
+@app.callback(
+    [Output("modal-preview-sql", "is_open"),
+     Output("preview-sql-code", "children")],
+    Input({"type": "btn-view-sql-rule", "index": dash.ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def view_rule_sql(n_clicks):
+    if not ctx.triggered:
+        return False, ""
+    
+    trig = ctx.triggered_id
+    if not isinstance(trig, dict):
+        return False, ""
+    
+    rule_id = trig.get("index")
+    if not rule_id:
+        return False, ""
+    
+    # Get rule details
+    rule_data = db_adapter.get_rule_details(rule_id)
+    
+    if "error" in rule_data:
+        return True, f"-- Error: {rule_data['error']}"
+    
+    # Generate SQL
+    sql = db_adapter.generate_sql_preview(
+        rule_data["project_id"],
+        rule_data["dataset_id"],
+        rule_data["template_name"],
+        rule_data["column_name"]
+    )
+    
+    return True, sql
 
 # 8. Filter Results on Page 5
 @app.callback(

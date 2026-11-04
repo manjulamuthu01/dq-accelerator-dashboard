@@ -1,478 +1,463 @@
-# Implementation Plan: Projects & Datasets Management
+# Implementation Plan: Rule Library / Rule Configuration Page (Phase 8)
 
-## Context & Architecture Decisions
+## Overview
+Complete, production-ready Rule Library / Rule Configuration page for the Dynamic Data Quality Accelerator. The system allows users to select projects, datasets, and predefined rule templates; configure rules with parameters; preview generated SQL; and save rules to the database with full audit logging.
 
-### Codebase Overview
-- **Frontend**: Dash + Dash Bootstrap Components + Plotly
-- **Backend**: Python with dual-mode db_adapter (Databricks SQL or local SQLite)
-- **Database**: dq_project_config, dq_table_config with metadata tables
-- **Existing Patterns**: Page-based routing in dash_app.py, callback-driven interactivity, query_df/execute_cmd for DB operations
-- **Schema**: Databricks Unity Catalog with fallback to local SQLite
-
-### Design Decisions
-
-1. **Backend Functions in db_adapter.py**: Following existing patterns (query_df, execute_cmd), add 8 new functions for CRUD operations. Each returns structured {status, message, data} responses.
-
-2. **Table Connectivity Testing**: Use Spark/SQL SELECT COUNT(*) to verify table exists and is accessible. For local SQLite, verify table schema directly. Return clear success/error messages.
-
-3. **Configuration Validation**: Expand accelerator/config.py with a new ConfigValidator class to parse catalog.schema.table safely, validate required fields, and return structured validation errors.
-
-4. **Frontend Modals**: Enhance dash_app.py page_management() with Add/Edit/View modals. Use dcc.Store for edit context, pattern matching for dynamic button IDs (View/Edit/Disable/Enable per project).
-
-5. **State Management**: Use dcc.Store + pattern-matching callbacks for modal state. Refresh management table via "project-refresh-store" trigger after any mutation (Add/Edit/Toggle).
-
-6. **Error Handling**: All db_adapter functions catch exceptions, log to console, and return {status: "error", message: "...", data: {}}. Frontend displays toast notifications with severity levels.
-
-7. **Data Flow**: Create Project → auto-open Register Dataset modal → Test Connectivity → Register Dataset → refresh projects table → enable View/Edit/Disable.
+**Key Constraint**: All SQL generation uses controlled templates from `dq_rule_templates` with injection-safe placeholder replacement. No raw user SQL is executed.
 
 ---
 
-## Implementation Plan
+## Backend Functions (db_adapter.py)
 
-### 1. Expand accelerator/config.py: Add ConfigValidator Class
-Add a new ConfigValidator class to validate user inputs and parse table references safely.
+### 1. Get Projects for Dropdown
+- **Function**: `get_projects_for_dropdown() -> pd.DataFrame`
+- **What it does**: Returns all active projects from `dq_project_config` with columns `project_id`, `project_name`, `description`.
+- **Query**: `SELECT project_id, project_name, description FROM dq_project_config WHERE active = true ORDER BY project_name`
+- **Files**: db_adapter.py
+- **Verify**: Unit test calls the function and confirms it returns a non-empty DataFrame with correct columns.
 
-**Rationale**: Centralize configuration validation following the existing Config class pattern in accelerator/config.py. Keeps validation logic reusable and separate from db_adapter CRUD logic.
+### 2. Get Datasets for Project (Filtered)
+- **Function**: `get_datasets_for_project(project_name: Optional[str] = None) -> List[str]`
+- **What it does**: Already exists in codebase but needs to be verified and enhanced if necessary. Returns dataset names for a given project.
+- **Current location**: Line ~1005 in db_adapter.py
+- **Verify**: Confirm it filters by project_id from the project lookup, returns only active datasets.
 
-**Files**: accelerator/config.py
-**Verify**: `python -c "from accelerator import ConfigValidator; print('Import successful')"` — no errors.
+### 3. Get Rule Templates
+- **Function**: `get_rule_templates() -> pd.DataFrame`
+- **What it does**: Retrieves all active rule templates from `dq_rule_templates` with columns: `template_id`, `template_name`, `category`, `description`, `requires_column`, `requires_target`, `result_type`, `template_sql`.
+- **Query**: `SELECT template_id, template_name, category, description, requires_column, requires_target, result_type, template_sql FROM dq_rule_templates WHERE is_active = true ORDER BY template_name`
+- **Files**: db_adapter.py
+- **Verify**: Confirm all 14 templates load from the DB; check that `template_sql` contains placeholders like `{source_table}`, `{column_name}`, etc.
 
----
+### 4. Get Configured Rules for Project + Dataset
+- **Function**: `get_configured_rules(project_id: int, dataset_id: int) -> pd.DataFrame`
+- **What it does**: Fetches all rules (active and inactive) for a specific project + dataset combination. Returns: `rule_id`, `rule_name`, `column_name`, `threshold`, `severity`, `active`, `created_at`, `template_name`.
+- **Query**: 
+  ```sql
+  SELECT rule_id, rule_name, column_name, threshold, severity, active, created_at, template_name
+  FROM dq_rules
+  WHERE project_id = ? AND dataset_id = ?
+  ORDER BY created_at DESC
+  ```
+- **Files**: db_adapter.py
+- **Verify**: Call with a known project/dataset pair (e.g., Hospital, source_table) and confirm it returns all existing rules for that combination.
 
-### 2. Add Backend CRUD Functions to db_adapter.py
-Implement 8 new backend functions following existing db_adapter patterns (query_df, execute_cmd, exception handling).
+### 5. Get Rule Details (for Edit Modal)
+- **Function**: `get_rule_details(rule_id: int) -> Dict[str, Any]`
+- **What it does**: Fetches a single rule for pre-filling the edit form. Returns all fields: `rule_id`, `rule_name`, `project_id`, `dataset_id`, `template_name`, `column_name`, `threshold`, `severity`, `active`.
+- **Query**:
+  ```sql
+  SELECT rule_id, rule_name, project_id, dataset_id, template_name, column_name, threshold, severity, active
+  FROM dq_rules
+  WHERE rule_id = ?
+  ```
+- **Files**: db_adapter.py
+- **Verify**: Fetch a known rule ID and confirm all fields are populated correctly.
 
-**Rationale**: db_adapter already handles dual-mode (Databricks/SQLite), SQL parameter binding, and structured DataFrame returns. New functions follow the same error-handling model: try Databricks, fall back to local, return {status, message, data}.
+### 6. Generate SQL Preview
+- **Function**: `generate_sql_preview(project_id: int, dataset_id: int, template_name: str, column_name: Optional[str] = None) -> str`
+- **What it does**: 
+  - Looks up the dataset's source table, target table, and business key from `dq_table_config`.
+  - Looks up the rule template's `template_sql` from `dq_rule_templates`.
+  - Safely replaces all placeholders: `{source_table}` → full catalog.schema.table, `{target_table}` → full catalog.schema.table, `{column_name}` → user-provided or business key, `{rule_parameter}` → business key.
+  - Returns the rendered SQL string.
+- **Validation**: 
+  - Source table path must be catalog.schema.table format.
+  - Column names are user input but not directly interpolated; the template controls SQL structure.
+- **Files**: db_adapter.py
+- **Verify**: Call with NULL_COUNT template, Hospital project, source_table dataset, column "patient_name". Confirm output is: `SELECT COUNT(*) AS failure_count FROM hospital_catalog.healthcare.patients_source WHERE patient_name IS NULL`
 
-**Files**: db_adapter.py
-**Functions to add**:
-- `create_project(project_name, description, owner, domain)` → {status, message, data: {project_id, project_name}}
-- `create_dataset(project_id, dataset_name, source_table, target_table, business_key)` → {status, message, data: {dataset_id}}
-- `test_table_connectivity(catalog, schema, table)` → {status, message, data: {accessible: bool, table_exists: bool}}
-- `get_project_details(project_id)` → {status, message, data: {project_info, datasets_list, last_execution, dq_score}}
-- `get_all_projects()` → {status, message, data: {projects_df}}
-- `update_project(project_id, project_name, description, owner)` → {status, message, data: {}}
-- `toggle_project_active_status(project_id)` → {status, message, data: {new_active_status}}
-- `get_dataset_rules(dataset_id)` → {status, message, data: {rules_df}}
+### 7. Validate and Save Rule
+- **Function**: `save_rule(project_id: int, dataset_id: int, template_name: str, rule_name: str, column_name: Optional[str], threshold: float, severity: str, active: bool, user: str = "admin") -> Dict[str, Any]`
+- **What it does**:
+  - Validates: project_id and dataset_id exist and are active.
+  - Validates: template_name exists in `dq_rule_templates`.
+  - Validates: column_name is provided if template requires it.
+  - Validates: severity is one of `["Critical", "High", "Medium", "Low"]`.
+  - Validates: threshold is numeric.
+  - Checks for duplicate rule: same project + dataset + template + column (optional).
+  - If all validations pass:
+    - Generate a unique `rule_id` (auto-increment).
+    - INSERT into `dq_rules` with all fields.
+    - Log the action in `dq_config_audit` with action="INSERT", entity_type="dq_rules", changed_by=user.
+  - Returns: `{"success": bool, "message": str, "rule_id": int}` or error details.
+- **Error Responses**: 
+  - `{"success": false, "message": "Project not found or inactive"}`
+  - `{"success": false, "message": "Dataset not found or inactive"}`
+  - `{"success": false, "message": "Template not found"}`
+  - `{"success": false, "message": "Column required for this template"}`
+  - `{"success": false, "message": "Invalid severity"}`
+  - `{"success": false, "message": "Duplicate rule"}`
+- **Files**: db_adapter.py
+- **Verify**: Call with valid inputs; confirm INSERT succeeds and audit log records the action. Then call with duplicate inputs; confirm it returns error.
 
-**Verify**: `pytest test_phase8.py -v -k "test_create" 2>&1 | grep -E "(PASS|FAIL|ERROR)"` — all new CRUD tests pass locally.
+### 8. Update Existing Rule
+- **Function**: `update_rule(rule_id: int, rule_name: str, column_name: Optional[str], threshold: float, severity: str, active: bool, user: str = "admin") -> Dict[str, Any]`
+- **What it does**:
+  - Validates inputs (severity, threshold).
+  - UPDATEs `dq_rules` table where rule_id = ?.
+  - Logs the action in `dq_config_audit` with old and new values.
+  - Returns: `{"success": bool, "message": str}`.
+- **Files**: db_adapter.py
+- **Verify**: Fetch a rule, modify its threshold/severity, update it, and confirm the DB reflects the change.
 
----
+### 9. Delete or Deactivate Rule
+- **Function**: `delete_rule(rule_id: int, user: str = "admin", hard_delete: bool = False) -> Dict[str, Any]`
+- **What it does**:
+  - If `hard_delete=False` (default): SET active=false on the rule. Preserves all execution history in `dq_results`.
+  - If `hard_delete=True`: DELETE from `dq_rules`. (Use with caution; only when explicitly requested.)
+  - Logs the action in `dq_config_audit`.
+  - Returns: `{"success": bool, "message": str}`.
+- **Critical**: Deleting or deactivating a rule must NEVER touch `dq_results`. Execution history is immutable.
+- **Files**: db_adapter.py
+- **Verify**: Deactivate a rule; confirm it is marked inactive but previous results remain in `dq_results`.
 
-### 3. Modify dash_app.py: Enhance page_management() with Add Project & Edit Modals
-Update the page_management() function to include fully functional modals for Add Project, Register Dataset, Edit Project, and project actions (View/Edit/Disable/Enable).
-
-**Rationale**: The existing modals are already defined (modal-add-project, modal-edit-project, modal-view-project) but are not wired to backend functions or state management. Enhance them to open on button clicks and call new backend functions.
-
-**Files**: dash_app.py, _build_management_table_rows() and page_management()
-**Changes**:
-- Ensure Add Project modal opens when "Add Project" button clicked
-- Add Register Dataset modal (currently not visible) to open after project creation
-- Ensure View/Edit/Disable/Enable buttons trigger correct callbacks
-- Wire project-refresh-store dcc.Store to trigger table refresh after mutations
-
-**Verify**: Open http://localhost:8050/management in browser — "Add Project" button opens modal, "View/Edit/Disable/Enable" links are clickable (no JS errors in console).
-
----
-
-### 4. Implement Management Page Callbacks in dash_app.py
-Add / expand callbacks to wire modals to backend functions and handle form submissions.
-
-**Rationale**: Callbacks already exist (handle_add_project, handle_edit_project, handle_view_project, handle_table_actions) but may not fully implement all backend calls or error handling. Ensure each calls the new db_adapter functions and updates UI accordingly.
-
-**Files**: dash_app.py
-**Callbacks**:
-- `handle_add_project`: POST project details to db_adapter.create_project() → open Register Dataset modal
-- `handle_test_connectivity`: POST table refs to db_adapter.test_table_connectivity() → show success/error toast
-- `handle_register_dataset`: POST dataset details to db_adapter.create_dataset() → refresh management table
-- `handle_view_project`: Load project details via db_adapter.get_project_details() → render modal body
-- `handle_edit_project`: Load current values, save edits via db_adapter.update_project() → refresh table
-- `handle_toggle_project`: POST to db_adapter.toggle_project_active_status() → refresh table
-- `refresh_management_table`: Triggered by project-refresh-store, rebuild table rows via _build_management_table_rows()
-
-**Verify**: 
-- Create a project via modal → verify it appears in projects table
-- Click View → verify project details page loads
-- Click Edit → verify form pre-fills and save updates the table
-- Click Disable → verify status badge changes to "Inactive"
-- Click Enable → verify status badge changes to "Active"
-
----
-
-### 5. Add Backend Function: db_adapter.create_project()
-Implement project creation with INSERT into dq_project_config table.
-
-**Rationale**: First CRUD operation. Establishes pattern for all other functions: validate inputs, execute SQL, handle exceptions, return structured response.
-
-**Files**: db_adapter.py
-**SQL**: `INSERT INTO dq_project_config (project_name, description, owner, active, created_at, updated_at) VALUES (?, ?, ?, 1, NOW(), NOW())`
-**Validation**: 
-- project_name required (non-empty string)
-- owner required
-- description optional
-- Check for duplicate project_name before insert
-
-**Response Shape**:
-```python
-{
-  "status": "success|error",
-  "message": "Project 'Banking' created successfully|Error: duplicate project name|Error: invalid input",
-  "data": {"project_id": 123, "project_name": "Banking"}
-}
-```
-
-**Verify**: `pytest test_phase8.py::test_create_project -v` — passes, returns correct project_id.
-
----
-
-### 6. Add Backend Function: db_adapter.create_dataset()
-Implement dataset registration with INSERT into dq_table_config table.
-
-**Rationale**: Second CRUD operation, depends on project creation. Stores source/target table refs and business key.
-
-**Files**: db_adapter.py
-**SQL**: `INSERT INTO dq_table_config (project_id, dataset_name, source_table, target_table, business_key, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, NOW(), NOW())`
-**Validation**: 
-- project_id must exist (FK constraint)
-- source_table and business_key required
-- Parse source_table as catalog.schema.table
-
-**Response Shape**:
-```python
-{
-  "status": "success|error",
-  "message": "Dataset registered|Error: project_id not found",
-  "data": {"dataset_id": 456}
-}
-```
-
-**Verify**: `pytest test_phase8.py::test_create_dataset -v` — passes, foreign key constraint enforced.
+### 10. Toggle Rule Active Status
+- **Function**: `toggle_rule_active(rule_id: int, user: str = "admin") -> Dict[str, Any]`
+- **What it does**:
+  - Fetches current active flag.
+  - Flips it (true → false, false → true).
+  - UPDATEs `dq_rules`.
+  - Logs the action in `dq_config_audit`.
+  - Returns: `{"success": bool, "message": str, "new_status": bool}`.
+- **Files**: db_adapter.py
+- **Verify**: Toggle a rule on/off and confirm the flag flips correctly.
 
 ---
 
-### 7. Add Backend Function: db_adapter.test_table_connectivity()
-Implement table connectivity test via Spark/SQL query or SQLite schema check.
+## Frontend Callbacks (dash_app.py)
 
-**Rationale**: Validate table existence and user access before saving dataset config. Provides early feedback to user (success/error toast).
+The page_rules() function and its associated callbacks handle all user interactions. All callbacks operate on the existing Rule Configuration page layout (HTML structure already present in page_rules() function starting at line ~869).
 
-**Files**: db_adapter.py
-**Implementation**:
-- **Databricks mode**: Execute `SELECT COUNT(*) FROM {catalog}.{schema}.{table}` via Spark/SQL cursor
-- **SQLite mode**: Check if table exists via SQLite schema query
-- Catch exceptions (table not found, access denied, etc.)
+### Callback 1: Project Selection → Dataset Dropdown Refresh
+- **Trigger**: `Input("rule-select-project", "value")` (project dropdown change)
+- **Output**: `Output("rule-select-dataset", "options")` (dataset dropdown options)
+- **Logic**:
+  1. Get the selected project_name from the input.
+  2. Call `db_adapter.get_projects_for_dropdown()` to find project_id.
+  3. Call `db_adapter.get_datasets_for_project(project_name)` to fetch dataset names.
+  4. Return list of dicts: `[{"label": ds, "value": ds} for ds in datasets]`.
+  5. Set dataset value to the first dataset (or "source_table" if available).
+- **Files**: dash_app.py (add/modify callback ~line 2090)
+- **Verify**: Select "Hospital", confirm dataset dropdown shows "source_table". Select "Banking", confirm it shows "customer".
 
-**Response Shape**:
-```python
-{
-  "status": "success|error",
-  "message": "Table is accessible (count: 12345 rows)|Error: table not found|Error: access denied",
-  "data": {"accessible": true/false, "table_exists": true/false, "row_count": 12345}
-}
-```
+### Callback 2: Dataset Selection → Refresh Configured Rules Table
+- **Trigger**: 
+  - `Input("rule-select-project", "value")`
+  - `Input("rule-select-dataset", "value")`
+- **Output**: `Output("configured-rules-table-body", "children")` (table body rows)
+- **Logic**:
+  1. Get selected project_name and dataset_name.
+  2. Look up project_id and dataset_id from the DB.
+  3. Call `db_adapter.get_configured_rules(project_id, dataset_id)`.
+  4. For each row, build an `<tr>` with: rule_name, column_name, threshold, severity, active badge, created_at, and Actions (View SQL, Edit, Delete, Toggle).
+  5. Return the list of `<tr>` elements.
+- **Files**: dash_app.py
+- **Verify**: Select Hospital + source_table; confirm the table populates with the configured rules. Change dataset; confirm table updates.
 
-**Verify**: `pytest test_phase8.py::test_connectivity -v` — passes for existing tables, fails gracefully for non-existent tables.
+### Callback 3: Template Tile Click → Populate Configuration Form
+- **Trigger**: `Input({"type": "template-tile", "index": ALL}, "n_clicks")`
+- **Outputs**:
+  - `Output("rule-input-name", "value")` (rule name)
+  - `Output("rule-input-column", "placeholder")`  (column placeholder)
+  - `Output("rule-input-threshold", "value")` (default threshold)
+  - `Output("rule-input-threshold", "placeholder")` (threshold help text)
+- **Logic**:
+  1. Identify which template tile was clicked using `ctx.triggered`.
+  2. Look up the template from `db_adapter.get_rule_templates()`.
+  3. Pre-fill:
+     - Rule Name: template_name (editable).
+     - Column placeholder: "Required: column name" or "Optional" based on template.requires_column.
+     - Threshold: template's default_threshold.
+     - Severity: default to "High".
+     - Active: default to True.
+  4. Show/hide column input based on requires_column.
+  5. Show/hide target table selection based on requires_target.
+- **Files**: dash_app.py
+- **Verify**: Click NULL_COUNT tile; confirm form shows "NULL_COUNT" as rule name and column input is visible. Click ROW_COUNT; confirm column input is hidden.
 
----
+### Callback 4: Preview SQL Button → Modal with Generated SQL
+- **Trigger**: `Input("btn-preview-sql", "n_clicks")`
+- **Outputs**:
+  - `Output("modal-preview-sql", "is_open")`
+  - `Output("preview-sql-code", "children")`
+- **States**:
+  - `State("rule-select-project", "value")` (selected project)
+  - `State("rule-select-dataset", "value")` (selected dataset)
+  - `State("rule-input-name", "value")` (rule name, used to infer template)
+  - `State("rule-input-column", "value")` (column name)
+- **Logic**:
+  1. Infer template_name from rule name (or track it in a hidden dcc.Store).
+  2. Get project_id and dataset_id.
+  3. Call `db_adapter.generate_sql_preview(project_id, dataset_id, template_name, column_name)`.
+  4. Display SQL in a `<pre>` block inside the modal.
+  5. Set `is_open=True` to show the modal.
+- **Files**: dash_app.py
+- **Verify**: Select Hospital + source_table, choose NULL_COUNT, enter "patient_name", click Preview SQL. Modal opens and shows the correct SQL with full table path.
 
-### 8. Add Backend Function: db_adapter.get_project_details()
-Implement rich project view with project info, datasets, rules, last execution, and DQ score.
+### Callback 5: Save Rule Button → Validate, Insert, Show Toast, Refresh Table
+- **Trigger**: `Input("btn-save-rule", "n_clicks")`
+- **Outputs**:
+  - `Output("global-toast", "is_open")`
+  - `Output("global-toast", "children")`
+  - `Output("configured-rules-table-body", "children")`  (refresh table)
+  - `Output("rule-input-name", "value")` (reset form)
+  - `Output("rule-input-column", "value")` (reset form)
+  - `Output("rule-input-threshold", "value")` (reset form)
+  - `Output("rule-select-severity", "value")` (reset form)
+  - `Output("rule-switch-active", "value")` (reset form)
+- **States**: All form fields (project, dataset, rule name, column, threshold, severity, active).
+- **Logic**:
+  1. Validate all inputs on the client side (non-empty rule name, valid threshold, severity in list).
+  2. Look up project_id and dataset_id.
+  3. Infer template_name from rule name (or use hidden Store).
+  4. Call `db_adapter.save_rule(project_id, dataset_id, template_name, rule_name, column_name, threshold, severity, active, user="admin")`.
+  5. If success:
+     - Show success toast: "Rule saved successfully!".
+     - Refresh the configured rules table by calling Callback 2.
+     - Clear the form.
+  6. If error:
+     - Show error toast with the error message.
+     - Do NOT refresh the table or clear the form; let user correct and retry.
+- **Files**: dash_app.py
+- **Verify**: Fill in form (Hospital, source_table, NULL_COUNT, patient_name, 0, High), click Save. Toast shows success, table updates. Try to save a duplicate; toast shows error.
 
-**Rationale**: Supports View Project modal. Joins dq_project_config, dq_table_config, dq_rules, dq_execution_summary to show complete project picture.
+### Callback 6: Edit Button → Open Modal with Pre-filled Values
+- **Trigger**: `Input({"type": "btn-edit-rule", "index": ALL}, "n_clicks")`
+- **Outputs**:
+  - `Output("modal-edit-rule", "is_open")`
+  - `Output("edit-rule-id", "data")` (store rule_id for later)
+  - `Output("edit-rule-name", "value")`
+  - `Output("edit-rule-column", "value")`
+  - `Output("edit-rule-threshold", "value")`
+  - `Output("edit-rule-severity", "value")`
+  - `Output("edit-rule-switch-active", "value")`
+- **Logic**:
+  1. Extract rule_id from the clicked button's index.
+  2. Call `db_adapter.get_rule_details(rule_id)`.
+  3. Populate the modal form with the fetched values.
+  4. Set `is_open=True` to show the modal.
+- **Files**: dash_app.py
+- **Verify**: Click Edit on an existing rule; modal opens with pre-filled values.
 
-**Files**: db_adapter.py
-**SQL**:
-- SELECT from dq_project_config WHERE project_id = ?
-- SELECT from dq_table_config WHERE project_id = ? (all datasets)
-- SELECT from dq_rules WHERE project_id = ? GROUP BY dataset_id (active rules per dataset)
-- SELECT * FROM dq_execution_summary WHERE project_id = ? ORDER BY started_at DESC LIMIT 1 (last execution)
+### Callback 7: Save Changes in Edit Modal
+- **Trigger**: `Input("btn-submit-edit-rule", "n_clicks")`
+- **Outputs**:
+  - `Output("modal-edit-rule", "is_open")`
+  - `Output("global-toast", "is_open")`
+  - `Output("global-toast", "children")`
+  - `Output("configured-rules-table-body", "children")`  (refresh table)
+- **States**: All edit form fields + `State("edit-rule-id", "data")`.
+- **Logic**:
+  1. Validate inputs.
+  2. Call `db_adapter.update_rule(rule_id, rule_name, column_name, threshold, severity, active, user="admin")`.
+  3. If success: close modal, show success toast, refresh table.
+  4. If error: show error toast, keep modal open.
+- **Files**: dash_app.py
+- **Verify**: Edit a rule (change threshold from 0 to 5), save. Table updates and rule now shows new threshold.
 
-**Response Shape**:
-```python
-{
-  "status": "success|error",
-  "message": "...",
-  "data": {
-    "project": {"project_id": 1, "project_name": "...", "owner": "...", "active": true, "created_at": "..."},
-    "datasets": [{"dataset_id": 10, "dataset_name": "...", "source_table": "...", "business_key": "..."}],
-    "rules": [{"rule_id": 100, "rule_name": "...", "dataset_id": 10}],
-    "last_execution": {"execution_id": "...", "overall_status": "PASS", "dq_score": 98.5, "started_at": "..."},
-    "dq_score": 98.5
-  }
-}
-```
+### Callback 8: Delete Button → Confirmation, Call Backend, Refresh Table
+- **Trigger**: `Input({"type": "btn-delete-rule", "index": ALL}, "n_clicks")`
+- **Outputs**:
+  - `Output("modal-delete-confirm", "is_open")`  (show confirmation modal)
+  - `Output("delete-rule-id", "data")` (store rule_id)
+- **Then**, after user confirms:
+  - `Input("btn-confirm-delete", "n_clicks")`
+  - **Outputs**:
+    - `Output("modal-delete-confirm", "is_open")` (close modal)
+    - `Output("global-toast", "is_open")`
+    - `Output("global-toast", "children")`
+    - `Output("configured-rules-table-body", "children")` (refresh table)
+- **Logic**:
+  1. On delete button click: show confirmation modal.
+  2. On confirm click: call `db_adapter.delete_rule(rule_id, hard_delete=False)` (soft delete; marks inactive).
+  3. Show success toast, refresh table.
+- **Files**: dash_app.py
+- **Verify**: Click Delete on a rule; confirmation modal appears. Click Confirm; table updates and rule is no longer visible (or marked inactive). Verify `dq_results` still contains the rule's execution history.
 
-**Verify**: `pytest test_phase8.py::test_get_project_details -v` — passes, returns all nested data structures correctly.
+### Callback 9: Toggle Button → Flip Active Flag, Refresh Table
+- **Trigger**: `Input({"type": "btn-toggle-rule", "index": ALL}, "n_clicks")`
+- **Outputs**:
+  - `Output("global-toast", "is_open")`
+  - `Output("global-toast", "children")`
+  - `Output("configured-rules-table-body", "children")` (refresh table)
+- **Logic**:
+  1. Extract rule_id from button index.
+  2. Call `db_adapter.toggle_rule_active(rule_id, user="admin")`.
+  3. Show success toast with new status.
+  4. Refresh the table.
+- **Files**: dash_app.py
+- **Verify**: Click Toggle on an active rule; it becomes inactive (show "Inactive" badge). Click again; it becomes active again.
 
----
-
-### 9. Add Backend Function: db_adapter.get_all_projects()
-Implement projects list with dataset count.
-
-**Rationale**: Powers management table display. Uses existing pattern (query_df) but adds dataset count aggregation.
-
-**Files**: db_adapter.py
-**SQL**:
-```sql
-SELECT p.project_id, p.project_name, p.description, p.owner, p.active, p.created_at,
-       COUNT(DISTINCT d.dataset_id) AS dataset_count
-FROM dq_project_config p
-LEFT JOIN dq_table_config d ON p.project_id = d.project_id
-GROUP BY p.project_id, p.project_name, p.description, p.owner, p.active, p.created_at
-ORDER BY p.created_at DESC
-```
-
-**Response Shape**: Returns DataFrame (pandas) with columns: project_id, project_name, description, owner, active, created_at, dataset_count.
-
-**Verify**: `pytest test_phase8.py::test_get_all_projects -v` — passes, DataFrame has all expected columns, dataset_count aggregates correctly.
-
----
-
-### 10. Add Backend Function: db_adapter.update_project()
-Implement project edit (update project_name, description, owner).
-
-**Rationale**: Supports Edit modal. Updates dq_project_config with new values.
-
-**Files**: db_adapter.py
-**SQL**: `UPDATE dq_project_config SET project_name = ?, description = ?, owner = ?, updated_at = NOW() WHERE project_id = ?`
-**Validation**:
-- project_id must exist
-- new project_name must be unique (if changed)
-
-**Response Shape**:
-```python
-{
-  "status": "success|error",
-  "message": "Project updated|Error: duplicate project_name",
-  "data": {}
-}
-```
-
-**Verify**: `pytest test_phase8.py::test_update_project -v` — passes, duplicate name check works.
-
----
-
-### 11. Add Backend Function: db_adapter.toggle_project_active_status()
-Implement Disable/Enable toggle (flip active flag in dq_project_config).
-
-**Rationale**: Supports Disable/Enable buttons. Toggles active status and prevents new executions for inactive projects.
-
-**Files**: db_adapter.py
-**SQL**: `UPDATE dq_project_config SET active = NOT active, updated_at = NOW() WHERE project_id = ?`
-
-**Response Shape**:
-```python
-{
-  "status": "success|error",
-  "message": "Project disabled|Project enabled",
-  "data": {"new_active_status": true/false}
-}
-```
-
-**Verify**: `pytest test_phase8.py::test_toggle_status -v` — passes, status flips correctly.
-
----
-
-### 12. Add Backend Function: db_adapter.get_dataset_rules()
-Implement rules list for a specific dataset.
-
-**Rationale**: Supports View Project modal to show active DQ rules for each dataset.
-
-**Files**: db_adapter.py
-**SQL**:
-```sql
-SELECT rule_id, rule_name, template_name, category, severity, column_name, threshold
-FROM dq_rules
-WHERE dataset_id = ? AND active = 1
-ORDER BY created_at DESC
-```
-
-**Response Shape**: Returns DataFrame with columns: rule_id, rule_name, template_name, category, severity, column_name, threshold.
-
-**Verify**: `pytest test_phase8.py::test_get_dataset_rules -v` — passes, returns only active rules for specified dataset.
-
----
-
-### 13. Enhance dash_app.py Callback: handle_add_project()
-Wire Add Project form to db_adapter.create_project(), then auto-open Register Dataset modal.
-
-**Rationale**: Current callback may not fully call backend functions or chain to dataset modal. Ensure:
-1. Validate inputs on frontend (required fields)
-2. Call db_adapter.create_project()
-3. On success: store project_id in dcc.Store, open Register Dataset modal, show success toast
-4. On error: show error alert in modal, keep modal open
-
-**Files**: dash_app.py
-**Verify**: 
-- Fill Add Project form → click "Create Project" → success toast appears → Register Dataset modal opens
-- Leave required field blank → click "Create Project" → error alert appears in modal
-
----
-
-### 14. Enhance dash_app.py Callback: handle_test_connectivity()
-Wire Test Connectivity button to db_adapter.test_table_connectivity().
-
-**Rationale**: Current callback may not fully call backend validation. Ensure:
-1. Parse source_table (catalog.schema.table) from input
-2. Call db_adapter.test_table_connectivity()
-3. Show success (green badge) or error (red badge) in modal
-
-**Files**: dash_app.py
-**Verify**: 
-- Enter valid table ref → click "Test Connectivity" → green success badge appears
-- Enter invalid table ref → click "Test Connectivity" → red error badge appears
-
----
-
-### 15. Enhance dash_app.py Callback: handle_view_project()
-Wire View button to db_adapter.get_project_details(), render project details modal.
-
-**Rationale**: Current callback may not fully load all nested project data. Ensure:
-1. Extract project_id from pattern-matched button click
-2. Call db_adapter.get_project_details(project_id)
-3. Render rich modal body with:
-   - Project info card (name, owner, domain, created_at)
-   - Datasets table (dataset_name, source, target, business_key, active status, actions)
-   - Active DQ rules list
-   - Last execution status
-   - Historical DQ score (from dq_execution_summary)
-4. Include "Configure DQ Rules" button to navigate to /rules
-
-**Files**: dash_app.py
-**Verify**: 
-- Click View on a project → modal opens with all nested data visible
-- Datasets table shows all datasets for that project
-- Rules list shows active rules
+### Callback 10: Search / Filter Rules Table
+- **Trigger**: `Input("input-search-rules", "value")`
+- **Output**: `Output("configured-rules-table-body", "children")`
+- **Logic**:
+  1. Get all rules for the selected project + dataset (as in Callback 2).
+  2. Filter rows by search term in rule_name or column_name (case-insensitive substring match).
+  3. Return filtered `<tr>` list.
+- **Files**: dash_app.py
+- **Verify**: Type "patient" in search; only rules with "patient" in name or column show up.
 
 ---
 
-### 16. Enhance dash_app.py Callback: handle_edit_project()
-Wire Edit button to load project data, then save updates via db_adapter.update_project().
+## Safe SQL Template Rendering (rule_engine.py)
 
-**Rationale**: Current callback may not fully pre-fill form or save changes. Ensure:
-1. Extract project_id from pattern-matched button click
-2. Load current values via db_adapter.get_project_details() or query_df
-3. Pre-fill modal form fields
-4. On Save: call db_adapter.update_project() with new values
-5. On success: close modal, refresh management table via project-refresh-store, show success toast
-6. On error: show error alert in modal
-
-**Files**: dash_app.py
-**Verify**: 
-- Click Edit on a project → modal opens with current values pre-filled
-- Change values → click "Save Changes" → management table updates
+### Enhancement: Safe Template Rendering Function
+- **Function**: `render_sql_safe(template_name: str, source_table: str, target_table: Optional[str], column_name: Optional[str], rule_parameter: Optional[str], threshold: Optional[float]) -> str`
+- **What it does**:
+  1. Validates that template_name exists in RULE_TEMPLATES.
+  2. Validates that source_table, target_table, column_name, rule_parameter are non-empty identifiers (alphanumeric, underscore, dot for catalog.schema.table).
+  3. Replaces placeholders using string.replace() (safe, no format strings).
+  4. Returns the rendered SQL or raises ValueError if validation fails.
+- **Validation Regex**: `^[a-zA-Z0-9_.]+$` for all identifiers.
+- **Files**: rule_engine.py
+- **Verify**: Call with valid inputs; SQL renders correctly. Call with SQL injection attempt (e.g., `"; DROP TABLE dq_rules; --"`); function rejects it with ValueError.
 
 ---
 
-### 17. Enhance dash_app.py Callback: handle_table_actions()
-Wire Toggle (Disable/Enable) buttons to db_adapter.toggle_project_active_status().
+## HTML Layout (dash_app.py, page_rules function)
 
-**Rationale**: Current callback may not fully handle toggle. Ensure:
-1. Extract project_id from pattern-matched button click
-2. Call db_adapter.toggle_project_active_status(project_id)
-3. On success: refresh management table, show confirmation toast ("Project disabled" / "Project enabled")
-4. On error: show error toast
+The page_rules() function already has most of the HTML structure in place. Ensure it includes:
 
-**Files**: dash_app.py
-**Verify**: 
-- Active project → click Disable → status changes to "Inactive", table updates
-- Inactive project → click Enable → status changes to "Active", table updates
+1. **Header Bar** (existing):
+   - Title: "Rule Configuration"
+   - Project dropdown (id="rule-select-project")
+   - Dataset dropdown (id="rule-select-dataset")
+   - "Add Rule" button (id="btn-add-rule-trigger") — optional, can trigger form reset
 
----
+2. **Left Panel: Available Rule Templates** (existing):
+   - Search input (id="input-search-template")
+   - Template tiles container (id="template-tiles-container")
+   - Each tile is clickable: id={"type": "template-tile", "id": template_name}
 
-### 18. Add Table Refresh Callback in dash_app.py
-Implement refresh_management_table() callback triggered by project-refresh-store.
+3. **Right Panel: Rule Configuration Form** (existing):
+   - Rule Name input (id="rule-input-name")
+   - Column input (id="rule-input-column") — hidden for ROW_COUNT, SCHEMA_CHANGE, etc.
+   - Threshold input (id="rule-input-threshold")
+   - Severity dropdown (id="rule-select-severity")
+   - Active toggle (id="rule-switch-active")
+   - Preview SQL button (id="btn-preview-sql")
+   - Save Rule button (id="btn-save-rule")
 
-**Rationale**: After any mutation (Add/Edit/Toggle), update the management table without full page reload.
+4. **Below Form: Configured Rules Table** (needs to be added or verified):
+   - Table ID: "configured-rules-table"
+   - Columns: Rule Name, Column, Threshold, Severity, Status (Active/Inactive), Created At, Actions
+   - Table body ID: "configured-rules-table-body"
+   - Action buttons:
+     - View SQL (id={"type": "btn-view-sql-rule", "index": rule_id})
+     - Edit (id={"type": "btn-edit-rule", "index": rule_id})
+     - Delete (id={"type": "btn-delete-rule", "index": rule_id})
+     - Toggle (id={"type": "btn-toggle-rule", "index": rule_id})
+   - Search input (id="input-search-rules")
 
-**Files**: dash_app.py
-**Callback**:
-```python
-@app.callback(
-    Output("management-table-body", "children"),
-    Input("project-refresh-store", "data"),
-    prevent_initial_call=True
-)
-def refresh_management_table(refresh_ts):
-    projects_df = db_adapter.get_all_projects()
-    return _build_management_table_rows(projects_df)
-```
+5. **Modals**:
+   - SQL Preview modal (id="modal-preview-sql") — existing
+   - Edit Rule modal (id="modal-edit-rule")
+   - Delete Confirmation modal (id="modal-delete-confirm")
 
-**Verify**: 
-- Create a project → management table updates without page reload
-- Edit a project → management table updates in real-time
-
----
-
-### 19. Test All Modals and Error States
-Verify modals open/close correctly, buttons are clickable, and error messages display clearly.
-
-**Rationale**: Ensures user experience is smooth and error feedback is actionable.
-
-**Files**: dash_app.py (manual testing)
-**Manual Tests**:
-- Open Add Project modal → all form fields visible and editable
-- Open Edit Project modal → form pre-fills with current values
-- Open View Project modal → all nested data (datasets, rules, execution) visible
-- Test connectivity with invalid table → error badge appears with clear message
-- Submit form with required fields empty → validation error shows
-- Submit form with valid data → success toast and modal closes
+6. **Hidden Stores** (for tracking state across callbacks):
+   - dcc.Store(id="edit-rule-id") — holds rule_id during edit
+   - dcc.Store(id="delete-rule-id") — holds rule_id during delete
+   - dcc.Store(id="current-template-name") — holds selected template name (for form population)
 
 ---
 
-### 20. Integration Test: End-to-End Project & Dataset Workflow
-Test complete flow: Add Project → Register Dataset → Test Connectivity → View → Edit → Disable/Enable.
+## Verification Steps
 
-**Rationale**: Ensures all components work together seamlessly.
+### Unit Tests (test_rule_library.py — new file)
+Create `test_rule_library.py` with tests for all backend functions:
 
-**Files**: test_phase8.py (new integration test)
-**Test Steps**:
-1. Create project via backend function
-2. Create dataset via backend function
-3. Test connectivity via backend function (verify success)
-4. Retrieve project details via backend function (verify all nested data)
-5. Update project via backend function (verify changes)
-6. Toggle project status via backend function (verify status flip)
-7. Retrieve updated project (verify all changes persisted)
+1. **test_get_projects_for_dropdown()**: Fetch projects, confirm Hospital, Banking, Logistics present.
+2. **test_get_datasets_for_project()**: Fetch datasets for Hospital, confirm "source_table" present. Fetch for Banking, confirm "customer" present.
+3. **test_get_rule_templates()**: Fetch templates, confirm all 14 templates loaded from DB.
+4. **test_get_configured_rules()**: Fetch rules for Hospital + source_table, confirm existing rules appear.
+5. **test_generate_sql_preview()**: Generate SQL for NULL_COUNT with Hospital + source_table + "patient_name", confirm output contains full table path and column.
+6. **test_save_rule()**: Save a new rule with valid inputs, confirm INSERT succeeds, audit log has entry, rule_id returned. Try saving duplicate, confirm error.
+7. **test_update_rule()**: Update a rule's threshold, confirm UPDATE succeeds, audit log has old/new values.
+8. **test_delete_rule()**: Soft delete a rule, confirm active=false. Verify dq_results unchanged.
+9. **test_toggle_rule_active()**: Toggle a rule, confirm flag flips, audit log recorded.
+10. **test_sql_injection_safety()**: Attempt to inject SQL in column name, confirm template renderer rejects it.
 
-**Verify**: `pytest test_phase8.py::test_end_to_end_project_workflow -v` — passes all steps, no errors.
+**Run**: `pytest test_rule_library.py -v`
+
+### Integration Test: End-to-End Rule Configuration Flow
+1. Open the app at http://localhost:8050.
+2. Navigate to "Rule Library" page.
+3. Select project "Hospital", dataset "source_table".
+4. Confirm configured rules table shows existing rules (if any).
+5. Click on "NULL_COUNT" template tile.
+6. Form populates: rule name="NULL_COUNT", column placeholder appears.
+7. Enter column name "patient_name", threshold 0, severity "High".
+8. Click "Preview SQL", modal shows: `SELECT COUNT(*) AS failure_count FROM hospital_catalog.healthcare.patients_source WHERE patient_name IS NULL`.
+9. Click "Save Rule", success toast appears, table adds new row with the rule.
+10. Click "Edit" on the new rule, modal shows pre-filled values, change threshold to 5, save. Table updates.
+11. Click "Toggle" on the rule; badge changes to "Inactive", click again; badge changes back to "Active".
+12. Click "Delete", confirmation modal appears, confirm delete. Rule disappears from table.
+13. Verify in DB: `SELECT * FROM dq_results WHERE rule_id = ?` — results still present (immutable history).
+14. Select project "Banking", dataset "customer", confirm a different set of rules (or empty if none configured).
+
+**Run**: Start dev server `python dash_app.py`, manual testing as above.
+
+### Database Verification
+1. **Check dq_rules insertion**: `SELECT * FROM dq_rules WHERE rule_name LIKE 'test_%' ORDER BY created_at DESC LIMIT 5` — confirm new rules appear.
+2. **Check audit logging**: `SELECT * FROM dq_config_audit WHERE entity_type = 'dq_rules' ORDER BY timestamp DESC LIMIT 10` — confirm INSERT, UPDATE, DELETE actions logged.
+3. **Check history preservation**: `SELECT * FROM dq_results WHERE rule_id = <deleted_rule_id>` — confirm results still exist after rule deletion.
 
 ---
 
-## Verification Steps (Global)
+## Files to Create or Modify
 
-After all changes, run:
+### Backend
+- **db_adapter.py**: Add functions 1-10 (listed above). Enhance existing `get_datasets_for_project()` if needed.
+- **rule_engine.py**: Add safe rendering function (optional; current implementation may be sufficient, verify during implementation).
 
-1. **Syntax Check**: `python -m py_compile dash_app.py db_adapter.py accelerator/config.py` — no compile errors
-2. **Import Check**: `python -c "import dash_app; import db_adapter; from accelerator import ConfigValidator"` — no import errors
-3. **Dash App Start**: `python dash_app.py` — app starts without errors (check http://localhost:8050)
-4. **Navigation**: Click through all pages in sidebar — all pages load without errors
-5. **Project Management Page**: 
-   - Click "Add Project" → modal opens
-   - Fill form → click "Create Project" → success toast → table updates
-   - Click "View" on a project → details modal shows all data
-   - Click "Edit" on a project → edit modal shows current values
-   - Click "Disable" → status changes to "Inactive"
-   - Click "Enable" → status changes to "Active"
-6. **Backend Tests**: `pytest test_phase8.py -v` — all existing + new tests pass
+### Frontend
+- **dash_app.py**:
+  - Enhance `page_rules()` function to include Configured Rules table and modals.
+  - Add Callbacks 1-10 (listed above).
+  - Ensure global-toast is available for success/error messages (already exists at line ~30).
+
+### Testing
+- **test_rule_library.py**: New test file with 10+ unit and integration tests.
 
 ---
 
-## File Summary
+## Success Criteria
 
-| File | Changes |
-|------|---------|
-| accelerator/config.py | Add ConfigValidator class with methods: validate_project(), validate_dataset(), parse_table_ref() |
-| db_adapter.py | Add 8 CRUD functions: create_project, create_dataset, test_table_connectivity, get_project_details, get_all_projects, update_project, toggle_project_active_status, get_dataset_rules |
-| dash_app.py | Enhance page_management(), _build_management_table_rows(); wire/expand callbacks: handle_add_project, handle_test_connectivity, handle_view_project, handle_edit_project, handle_table_actions, refresh_management_table |
-| test_phase8.py | Add integration test: test_end_to_end_project_workflow |
+1. ✓ Project dropdown loads all active projects from DB (no hardcoding).
+2. ✓ Dataset dropdown filters by selected project (dynamic).
+3. ✓ Rule templates load from dq_rule_templates table (all 14 templates visible).
+4. ✓ Clicking a template tile populates the configuration form with correct defaults.
+5. ✓ SQL preview generates correct SQL using actual catalog.schema.table paths and template placeholders.
+6. ✓ Save Rule validates all inputs and persists to dq_rules with audit logging.
+7. ✓ Configured Rules table shows project/dataset-specific rules and refreshes after save.
+8. ✓ Edit/Delete/Toggle operations work correctly and log to audit table.
+9. ✓ Deleting/deactivating a rule preserves dq_results history (immutable).
+10. ✓ SQL template rendering is injection-safe (validated identifiers, no raw interpolation).
+11. ✓ No errors on any user action; all data from metadata tables (zero hardcoding).
+12. ✓ Multiple projects can be managed independently on the same page.
+
+---
+
+## Implementation Order
+
+1. **Backend (db_adapter.py)**: Implement functions 1-10. Verify each with quick SQL queries.
+2. **Safe Rendering (rule_engine.py)**: Add or enhance rendering function if needed.
+3. **HTML Layout (dash_app.py)**: Verify page_rules() has all required HTML structure. Add missing modals/stores.
+4. **Callbacks (dash_app.py)**: Implement Callbacks 1-10 in sequence. Test each one individually.
+5. **Integration Testing**: Run end-to-end flow tests.
+6. **Unit Tests (test_rule_library.py)**: Write and run all tests. Ensure 100% pass rate.
 
 ---
 
 ## Notes
 
-- All responses from backend functions follow {status, message, data} structure for consistent error handling.
-- All callbacks use `prevent_initial_call=True` to avoid unnecessary execution on page load.
-- Pattern-matching IDs ({"type": "btn-view-proj", "id": project_id}) enable dynamic button handling.
-- project-refresh-store dcc.Store acts as a refresh signal — updated after each mutation.
-- Existing test patterns (Phase 6-8) provide templates for new backend function tests.
-- No breaking changes to existing pages (Overview, Rules, Execution, Results, Reconciliation, Alerts, Audit).
+- **No new dependencies**: All functions use existing libraries (pandas, sqlite3, datetime).
+- **Dual-mode architecture preserved**: All DB functions work with both Databricks and SQLite (via `get_db_mode()` and `query_df()` / `execute_cmd()`).
+- **Audit logging mandatory**: Every mutation (INSERT, UPDATE, DELETE) must log to `dq_config_audit` with timestamp, user, old/new values.
+- **History immutable**: Execution results in `dq_results` are never modified or deleted, even if the rule is deleted or deactivated.
+- **Threshold semantics**: Different templates interpret threshold differently (e.g., NULL_COUNT: threshold = max allowed nulls; NULL_PERCENT: threshold = max allowed null %; DATA_FRESHNESS: threshold = max age in hours). The UI should provide context.
+- **Column parameter logic**: Some templates require a column (NULL_COUNT, UNIQUE_COUNT, etc.). Others don't (ROW_COUNT, SCHEMA_CHANGE). The UI hides/shows column input based on `requires_column` from the template.
+- **Target table logic**: Some templates require both source and target (REFERENTIAL_INTEGRITY, SOURCE_TARGET_ROW_COUNT). The UI should show a target table selector for these.
+

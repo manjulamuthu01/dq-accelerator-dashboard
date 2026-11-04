@@ -261,6 +261,12 @@ def _init_local_db():
         except Exception:
             cur.execute(f"ALTER TABLE dq_table_config ADD COLUMN {col} TEXT")
 
+    # Phase 8: dq_rules table migration for updated_at column
+    try:
+        cur.execute("SELECT updated_at FROM dq_rules LIMIT 1")
+    except Exception:
+        cur.execute("ALTER TABLE dq_rules ADD COLUMN updated_at TEXT")
+
     conn.commit()
 
     # Seed initial datasets if empty
@@ -464,8 +470,30 @@ def log_config_audit(entity_type: str, entity_id: str, action: str,
                      changed_by: str = "admin") -> bool:
     """Records any project, dataset, or rule configuration change into dq_config_audit."""
     now = datetime.datetime.now().strftime("%d %b %Y, %I:%M %p")
-    old_str = json.dumps(old_value) if isinstance(old_value, (dict, list)) else (str(old_value) if old_value is not None else None)
-    new_str = json.dumps(new_value) if isinstance(new_value, (dict, list)) else (str(new_value) if new_value is not None else None)
+    
+    # Convert numpy/pandas types to native Python types for JSON serialization
+    def safe_serialize(val):
+        if val is None:
+            return None
+        if isinstance(val, (dict, list)):
+            # Handle pandas/numpy in dict/list
+            try:
+                return json.dumps(val)
+            except (TypeError, ValueError):
+                return str(val)
+        # Handle numpy/pandas scalars
+        try:
+            import numpy as np
+            if isinstance(val, (np.integer, np.int64)):
+                return str(int(val))
+            if isinstance(val, (np.floating, np.float64)):
+                return str(float(val))
+        except:
+            pass
+        return str(val)
+    
+    old_str = safe_serialize(old_value)
+    new_str = safe_serialize(new_value)
     
     return execute_cmd("""
     INSERT INTO dq_config_audit (entity_type, entity_id, action, changed_by, old_value, new_value, timestamp)
@@ -1295,6 +1323,272 @@ def get_reconciliation_data(project_name: str = "Hospital") -> Dict[str, Any]:
         "duplicate": "0",
         "samples": pd.DataFrame({"patient_id": ["1", "2", "3"], "patient_name": ["adi", "lily", "john"]}),
     }
+
+# =============================================================================
+# PHASE 8: RULE LIBRARY / RULE CONFIGURATION
+# =============================================================================
+
+def get_projects_for_dropdown() -> pd.DataFrame:
+    """Returns all active projects with project_id and project_name."""
+    return query_df("""
+    SELECT project_id, project_name, description
+    FROM dq_project_config
+    WHERE active = 1
+    ORDER BY project_name
+    """)
+
+def get_rule_templates() -> pd.DataFrame:
+    """Returns all active rule templates from dq_rule_templates."""
+    return query_df("""
+    SELECT template_id, template_name, category, description, requires_column, requires_target, 
+           result_type, template_sql, is_active
+    FROM dq_rule_templates
+    WHERE is_active = 1
+    ORDER BY template_name
+    """)
+
+def get_configured_rules(project_id: int, dataset_id: int) -> pd.DataFrame:
+    """Fetches all rules (active and inactive) for a specific project + dataset combination."""
+    return query_df("""
+    SELECT rule_id, rule_name, column_name, threshold, severity, active, created_at, template_name
+    FROM dq_rules
+    WHERE project_id = ? AND dataset_id = ?
+    ORDER BY created_at DESC
+    """, (project_id, dataset_id))
+
+def get_rule_details(rule_id: int) -> Dict[str, Any]:
+    """Fetches a single rule for pre-filling the edit form."""
+    df = query_df("""
+    SELECT rule_id, rule_name, project_id, dataset_id, template_name, column_name, threshold, severity, active
+    FROM dq_rules
+    WHERE rule_id = ?
+    """, (rule_id,))
+    
+    if df.empty:
+        return {"error": "Rule not found"}
+    
+    r = df.iloc[0]
+    return {
+        "rule_id": int(r["rule_id"]),
+        "rule_name": str(r["rule_name"]),
+        "project_id": int(r["project_id"]),
+        "dataset_id": int(r["dataset_id"]),
+        "template_name": str(r["template_name"]),
+        "column_name": str(r["column_name"]) if r["column_name"] else "",
+        "threshold": float(r["threshold"]),
+        "severity": str(r["severity"]),
+        "active": bool(r["active"]),
+    }
+
+def generate_sql_preview(project_id: int, dataset_id: int, template_name: str, 
+                        column_name: Optional[str] = None) -> str:
+    """
+    Generates SQL preview using the template's sql_pattern.
+    Replaces placeholders: {source_table}, {target_table}, {column_name}, {rule_parameter}
+    """
+    # Get table config
+    table_df = query_df("""
+    SELECT source_table, target_table, business_key
+    FROM dq_table_config
+    WHERE dataset_id = ?
+    """, (dataset_id,))
+    
+    if table_df.empty:
+        return "-- Dataset not found"
+    
+    source_table = table_df.iloc[0]["source_table"]
+    target_table = table_df.iloc[0]["target_table"]
+    business_key = table_df.iloc[0]["business_key"]
+    
+    # Get template
+    template_df = query_df("""
+    SELECT template_sql
+    FROM dq_rule_templates
+    WHERE template_name = ?
+    """, (template_name,))
+    
+    if template_df.empty:
+        return f"-- Template '{template_name}' not found"
+    
+    sql = template_df.iloc[0]["template_sql"]
+    
+    # Safe placeholder replacement
+    sql = sql.replace("{source_table}", source_table or "source_table")
+    sql = sql.replace("{target_table}", target_table or "target_table")
+    sql = sql.replace("{column_name}", column_name or "id")
+    sql = sql.replace("{rule_parameter}", business_key or "id")
+    
+    return sql
+
+def save_rule(project_id: int, dataset_id: int, template_name: str, rule_name: str,
+              column_name: Optional[str], threshold: float, severity: str, 
+              active: bool, user: str = "admin") -> Dict[str, Any]:
+    """
+    Validates and saves a new rule to dq_rules.
+    Returns: {"success": bool, "message": str, "rule_id": int}
+    """
+    # Validate project
+    proj_df = query_df("SELECT project_id, active FROM dq_project_config WHERE project_id = ?", (project_id,))
+    if proj_df.empty or not proj_df.iloc[0]["active"]:
+        return {"success": False, "message": "Project not found or inactive"}
+    
+    # Validate dataset
+    ds_df = query_df("SELECT dataset_id, active FROM dq_table_config WHERE dataset_id = ? AND project_id = ?", (dataset_id, project_id))
+    if ds_df.empty or not ds_df.iloc[0]["active"]:
+        return {"success": False, "message": "Dataset not found or inactive"}
+    
+    # Validate template
+    tmpl_df = query_df("SELECT template_name, category FROM dq_rule_templates WHERE template_name = ? AND is_active = 1", (template_name,))
+    if tmpl_df.empty:
+        return {"success": False, "message": "Template not found"}
+    
+    template_category = tmpl_df.iloc[0]["category"]
+    
+    # Validate severity
+    if severity not in ["Critical", "High", "Medium", "Low"]:
+        return {"success": False, "message": "Invalid severity"}
+    
+    # Validate threshold is numeric
+    try:
+        threshold = float(threshold)
+    except (ValueError, TypeError):
+        return {"success": False, "message": "Threshold must be numeric"}
+    
+    # Check for duplicates
+    dup_df = query_df("""
+    SELECT rule_id FROM dq_rules
+    WHERE project_id = ? AND dataset_id = ? AND template_name = ? AND column_name = ?
+    """, (project_id, dataset_id, template_name, column_name or ""))
+    
+    if not dup_df.empty:
+        return {"success": False, "message": "Duplicate rule (same template and column already configured)"}
+    
+    # Insert rule
+    now = datetime.datetime.now().strftime("%d %b %Y, %I:%M %p")
+    success = execute_cmd("""
+    INSERT INTO dq_rules (project_id, dataset_id, rule_name, template_name, category, column_name, threshold, severity, active, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (project_id, dataset_id, rule_name, template_name, template_category, column_name, threshold, severity, int(active), now))
+    
+    if not success:
+        return {"success": False, "message": "Failed to insert rule into database"}
+    
+    # Get the new rule_id
+    rule_df = query_df("""
+    SELECT rule_id FROM dq_rules
+    WHERE project_id = ? AND dataset_id = ? AND template_name = ? AND column_name = ?
+    ORDER BY created_at DESC LIMIT 1
+    """, (project_id, dataset_id, template_name, column_name or ""))
+    
+    if rule_df.empty:
+        return {"success": False, "message": "Failed to retrieve new rule ID"}
+    
+    rule_id = int(rule_df.iloc[0]["rule_id"])
+    
+    # Log audit
+    log_config_audit("RULE", str(rule_id), "CREATE", None, 
+                    {"template": template_name, "column": column_name, "threshold": threshold, "severity": severity},
+                    changed_by=user)
+    
+    return {"success": True, "message": "Rule saved successfully", "rule_id": rule_id}
+
+def update_rule(rule_id: int, rule_name: str, column_name: Optional[str], 
+                threshold: float, severity: str, active: bool, 
+                user: str = "admin") -> Dict[str, Any]:
+    """Updates an existing rule."""
+    # Validate severity
+    if severity not in ["Critical", "High", "Medium", "Low"]:
+        return {"success": False, "message": "Invalid severity"}
+    
+    # Validate threshold is numeric
+    try:
+        threshold = float(threshold)
+    except (ValueError, TypeError):
+        return {"success": False, "message": "Threshold must be numeric"}
+    
+    # Get current values for audit
+    old_df = query_df("SELECT rule_name, column_name, threshold, severity, active FROM dq_rules WHERE rule_id = ?", (rule_id,))
+    if old_df.empty:
+        return {"success": False, "message": "Rule not found"}
+    
+    old_row = old_df.iloc[0]
+    old_values = {
+        "rule_name": old_row["rule_name"],
+        "column_name": old_row["column_name"],
+        "threshold": old_row["threshold"],
+        "severity": old_row["severity"],
+        "active": bool(old_row["active"]),
+    }
+    
+    # Update rule
+    now = datetime.datetime.now().strftime("%d %b %Y, %I:%M %p")
+    success = execute_cmd("""
+    UPDATE dq_rules
+    SET rule_name = ?, column_name = ?, threshold = ?, severity = ?, active = ?, updated_at = ?
+    WHERE rule_id = ?
+    """, (rule_name, column_name, threshold, severity, int(active), now, rule_id))
+    
+    if not success:
+        return {"success": False, "message": "Failed to update rule"}
+    
+    # Log audit
+    new_values = {
+        "rule_name": rule_name,
+        "column_name": column_name,
+        "threshold": threshold,
+        "severity": severity,
+        "active": active,
+    }
+    log_config_audit("RULE", str(rule_id), "UPDATE", old_values, new_values, changed_by=user)
+    
+    return {"success": True, "message": "Rule updated successfully"}
+
+def delete_rule(rule_id: int, user: str = "admin", hard_delete: bool = False) -> Dict[str, Any]:
+    """Soft delete (mark inactive) or hard delete a rule."""
+    if hard_delete:
+        # Hard delete (dangerous - removes rule entirely)
+        success = execute_cmd("DELETE FROM dq_rules WHERE rule_id = ?", (rule_id,))
+        if success:
+            log_config_audit("RULE", str(rule_id), "DELETE", None, None, changed_by=user)
+            return {"success": True, "message": "Rule deleted"}
+    else:
+        # Soft delete (mark inactive, preserves history)
+        now = datetime.datetime.now().strftime("%d %b %Y, %I:%M %p")
+        success = execute_cmd("""
+        UPDATE dq_rules
+        SET active = 0, updated_at = ?
+        WHERE rule_id = ?
+        """, (now, rule_id))
+        if success:
+            log_config_audit("RULE", str(rule_id), "DEACTIVATE", {"active": True}, {"active": False}, changed_by=user)
+            return {"success": True, "message": "Rule deactivated"}
+    
+    return {"success": False, "message": "Failed to delete/deactivate rule"}
+
+def toggle_rule_active(rule_id: int, user: str = "admin") -> Dict[str, Any]:
+    """Flips the active flag for a rule."""
+    # Get current state
+    df = query_df("SELECT active FROM dq_rules WHERE rule_id = ?", (rule_id,))
+    if df.empty:
+        return {"success": False, "message": "Rule not found"}
+    
+    current_active = bool(df.iloc[0]["active"])
+    new_active = not current_active
+    
+    # Update
+    now = datetime.datetime.now().strftime("%d %b %Y, %I:%M %p")
+    success = execute_cmd("""
+    UPDATE dq_rules
+    SET active = ?, updated_at = ?
+    WHERE rule_id = ?
+    """, (int(new_active), now, rule_id))
+    
+    if success:
+        action = "ACTIVATE" if new_active else "DEACTIVATE"
+        log_config_audit("RULE", str(rule_id), action, {"active": current_active}, {"active": new_active}, changed_by=user)
+        return {"success": True, "message": f"Rule {'activated' if new_active else 'deactivated'}", "new_status": new_active}
+    
+    return {"success": False, "message": "Failed to toggle rule"}
 
 def get_audit_history_records(project_name: Optional[str] = None, search: Optional[str] = None) -> pd.DataFrame:
     sql = """

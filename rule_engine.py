@@ -134,6 +134,14 @@ RULE_TEMPLATES = {
     },
 }
 
+def _clean_str(val: Any, fallback: str) -> str:
+    if val is None:
+        return fallback
+    if isinstance(val, float) and (val != val):  # NaN check
+        return fallback
+    s = str(val).strip()
+    return fallback if (not s or s.lower() == "nan" or s.lower() == "none") else s
+
 def render_sql(template_name: str,
                source_table: str = "source_table",
                target_table: Optional[str] = "target_table",
@@ -145,11 +153,17 @@ def render_sql(template_name: str,
     if not tmpl:
         return f"-- Template '{template_name}' not found."
     
+    src_str = _clean_str(source_table, "source_table")
+    tgt_str = _clean_str(target_table, src_str)
+    col_str = _clean_str(column_name, "id")
+    param_str = _clean_str(rule_parameter, col_str)
+    thresh_str = "0" if (threshold is None or (isinstance(threshold, float) and threshold != threshold)) else str(threshold)
+
     query = tmpl["sql_template"]
-    query = query.replace("{source_table}", source_table or "source_table")
-    query = query.replace("{target_table}", target_table or "target_table")
-    query = query.replace("{column_name}", column_name or "id")
-    query = query.replace("{rule_parameter}", rule_parameter or (column_name or "id"))
-    query = query.replace("{threshold}", str(threshold if threshold is not None else 0))
+    query = query.replace("{source_table}", src_str)
+    query = query.replace("{target_table}", tgt_str)
+    query = query.replace("{column_name}", col_str)
+    query = query.replace("{rule_parameter}", param_str)
+    query = query.replace("{threshold}", thresh_str)
     return query
 

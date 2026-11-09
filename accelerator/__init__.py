@@ -1,25 +1,10 @@
 """
-Dynamic Data Quality Accelerator (Enterprise Edition)
-Reusable framework for data quality validation, reconciliation, alerting, and monitoring.
+Dynamic Data Quality Accelerator - Package Init
+Only exposes GenericOrchestrator which is the only module with real implementation.
+All other logic (alerts, reporting, reconciliation, storage, config) lives in db_adapter.py.
 """
 
-from accelerator.config import Config
-from accelerator.rule_engine import RuleEngine, RULE_TEMPLATES
 from accelerator.orchestrator import GenericOrchestrator
-from accelerator.reconciliation import ReconciliationEngine
-from accelerator.alerts import AlertManager
-from accelerator.reporting import ReportGenerator
-from accelerator.storage import StorageAdapter
 
 __version__ = "1.0.0"
-__all__ = [
-    "Config",
-    "RuleEngine",
-    "RULE_TEMPLATES",
-    "GenericOrchestrator",
-    "ReconciliationEngine",
-    "AlertManager",
-    "ReportGenerator",
-    "StorageAdapter",
-]
-
+__all__ = ["GenericOrchestrator"]

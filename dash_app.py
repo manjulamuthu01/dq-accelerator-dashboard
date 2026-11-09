@@ -10,12 +10,16 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
+from typing import Optional, List, Dict, Any, Union
+from flask import request, jsonify
 
 import dash
 from dash import Dash, html, dcc, Input, Output, State, ctx, dash_table
 import dash_bootstrap_components as dbc
 
 import db_adapter
+import scheduler_service
+import email_service
 from rule_engine import RULE_TEMPLATES, render_sql
 
 # -------------------------------------------------------------
@@ -333,11 +337,17 @@ app.index_string = """<!DOCTYPE html>
             position: absolute;
             top: 18px;
             left: 40px;
-            width: 35%;
+            right: auto;
+            width: 0%;
             height: 3px;
             background-color: #10B981;
             z-index: 2;
+            transition: width 0.6s ease;
         }
+        .stepper-line-active.stage-1 { width: 0%; }
+        .stepper-line-active.stage-2 { width: 33%; }
+        .stepper-line-active.stage-3 { width: 66%; }
+        .stepper-line-active.stage-full { left: 40px; right: 40px; width: auto; }
         .step-node {
             position: relative;
             z-index: 3;
@@ -377,6 +387,10 @@ app.index_string = """<!DOCTYPE html>
         }
         .step-label.active {
             color: #2563EB;
+        }
+        .step-label.done {
+            color: #10B981;
+            font-weight: 700;
         }
         /* Template item tile */
         .template-tile {
@@ -473,8 +487,13 @@ app.layout = html.Div([
     dcc.Location(id="url", refresh=False),
     dcc.Download(id="download-csv-action"),
     # Store that triggers a live refresh of the projects table after any mutation.
-    # Value is a timestamp string updated after Add/Edit/Toggle actions.
     dcc.Store(id="project-refresh-store", data=""),
+    # Store that triggers a live refresh of the alerts table/KPIs after Acknowledge/Close.
+    dcc.Store(id="alert-refresh-store", data=""),
+    # Execution & Monitoring store lives in the root layout so the latest run
+    # survives page navigation. The polling dcc.Interval lives on the Execution
+    # page itself so it never fires while its output components are unmounted.
+    dcc.Store(id="exec-store", data={}),
     render_sidebar(),
     html.Div(id="page-content", className="main-content"),
 
@@ -489,178 +508,447 @@ app.layout = html.Div([
     ),
 ])
 
+
+def _safe_triggered_id():
+    """Returns ctx.triggered_id safely, avoiding exceptions outside callback context."""
+    try:
+        return ctx.triggered_id
+    except Exception:
+        return None
+
+
+def _get_initial_catalog_options():
+    try:
+        cats = db_adapter.get_unity_catalogs()
+        opts = []
+        for c in cats:
+            name = c["name"] if isinstance(c, dict) else str(c)
+            comment = f" - {c.get('comment')}" if isinstance(c, dict) and c.get('comment') else ""
+            opts.append({"label": f"{name}{comment}", "value": name})
+        return opts
+    except Exception:
+        return []
+
+
+def _get_initial_schema_options(cat="hospital_catalog"):
+    try:
+        schemas = db_adapter.get_unity_schemas(cat)
+        opts = []
+        for s in schemas:
+            name = s["name"] if isinstance(s, dict) else str(s)
+            comment = f" - {s.get('comment')}" if isinstance(s, dict) and s.get('comment') else ""
+            opts.append({"label": f"{name}{comment}", "value": name})
+        return opts
+    except Exception:
+        return []
+
+
+def _get_initial_table_options(cat="hospital_catalog", sch="healthcare"):
+    try:
+        tables = db_adapter.get_unity_tables(cat, sch)
+        opts = []
+        for t in tables:
+            name = t["name"] if isinstance(t, dict) else str(t)
+            tbl_type = f" ({t.get('type')})" if isinstance(t, dict) and t.get('type') else ""
+            opts.append({"label": f"{name}{tbl_type}", "value": name})
+        return opts
+    except Exception:
+        return []
+
+
+def _get_initial_bkey_options(cat="hospital_catalog", sch="healthcare", tbl="source_table"):
+    try:
+        meta = db_adapter.get_unity_table_metadata(cat, sch, tbl)
+        cols = meta.get("columns", [])
+        b_cand = meta.get("business_key_candidates", [])
+        schema_map = {s.get("column"): s.get("sql_type", "STRING") for s in meta.get("schema_info", [])}
+        return [{"label": f"{c} ({schema_map.get(c, 'STRING')})" + (" [Key Candidate]" if c in b_cand else ""), "value": c} for c in cols]
+    except Exception:
+        return []
+
+
+def _build_table_preview_card(meta: dict):
+    """Renders table metadata badges, detected schema, and sample preview rows."""
+    if not meta:
+        return html.Div()
+
+    cat = meta.get("catalog", "")
+    sch = meta.get("schema", "")
+    tbl = meta.get("table", "")
+    full_table = meta.get("full_table_name", f"{cat}.{sch}.{tbl}")
+    tbl_type = meta.get("table_type", "MANAGED")
+    rec_count = meta.get("record_count", 0)
+    cols = meta.get("columns", [])
+    schema_info = meta.get("schema_info", [])
+    preview_rows = meta.get("preview_rows", [])
+    b_keys = meta.get("business_key_candidates", [])
+
+    # Schema badges
+    type_badges = []
+    for s in schema_info:
+        col_name = s.get("column", "")
+        col_type = s.get("sql_type", "STRING")
+        is_key = col_name in b_keys
+        type_badges.append(html.Span([
+            html.Span(col_name, className=f"fw-semibold {'text-primary' if is_key else 'text-dark'} me-1"),
+            html.Span(col_type, className="badge bg-light text-secondary border me-2 small"),
+            html.Span("KEY", className="badge bg-warning text-dark me-2 small") if is_key else None
+        ], className="d-inline-flex align-items-center mb-1"))
+
+    # Table preview
+    preview_table = html.Div([
+        html.Table([
+            html.Thead(html.Tr([
+                html.Th(c, style={"fontSize": "0.78rem", "backgroundColor": "#f8fafc", "whiteSpace": "nowrap"})
+                for c in cols
+            ])),
+            html.Tbody([
+                html.Tr([
+                    html.Td(str(row.get(c, "")), style={"fontSize": "0.75rem", "whiteSpace": "nowrap"})
+                    for c in cols
+                ])
+                for row in preview_rows[:5]
+            ]),
+        ], className="table table-sm table-striped table-bordered mb-0"),
+    ], style={"overflowX": "auto", "maxHeight": "220px"})
+
+    return html.Div([
+        # Table Metadata Header Badges
+        html.Div([
+            html.Span([
+                html.I(className="bi bi-database-fill-check text-success me-1"),
+                html.Span(full_table, className="fw-bold")
+            ], className="badge bg-success-subtle text-success border border-success me-2 px-3 py-2"),
+            html.Span([
+                html.I(className="bi bi-tag-fill me-1"),
+                f"Type: {tbl_type}"
+            ], className="badge bg-primary-subtle text-primary border border-primary me-2 px-3 py-2"),
+            html.Span([
+                html.I(className="bi bi-list-ol me-1"),
+                f"{rec_count:,} records"
+            ], className="badge bg-info-subtle text-info border border-info me-2 px-3 py-2"),
+            html.Span([
+                html.I(className="bi bi-layout-three-columns me-1"),
+                f"{len(cols)} columns detected"
+            ], className="badge bg-secondary-subtle text-secondary border me-2 px-3 py-2"),
+        ], className="d-flex flex-wrap align-items-center mb-3"),
+
+        # Detected Schema & Types
+        html.Div([
+            html.Div("DETECTED UNITY CATALOG SCHEMA & DATA TYPES", className="fw-bold text-muted small mb-2", style={"letterSpacing": "0.05em"}),
+            html.Div(type_badges, className="p-3 bg-white rounded border mb-3"),
+        ]),
+
+        # Live Data Preview Table
+        html.Div([
+            html.Div(f"DATASET PREVIEW (First {min(5, len(preview_rows))} of {rec_count:,} records)",
+                     className="fw-bold text-muted small mb-2", style={"letterSpacing": "0.05em"}),
+            html.Div(preview_table, className="border rounded bg-white p-2"),
+        ]),
+    ], className="p-3 bg-light rounded-3 border")
+
+
+def _get_initial_table_preview():
+    try:
+        meta = db_adapter.get_unity_table_metadata("hospital_catalog", "healthcare", "source_table")
+        return _build_table_preview_card(meta)
+    except Exception:
+        return html.Div()
+
+
+def _real_click() -> bool:
+    """True only when the triggering input is a genuine click (n_clicks > 0).
+
+    Pattern-matching (dash.ALL) callbacks also fire when the buttons are first
+    rendered or re-rendered, with n_clicks=None or [None, ...]. Acting on those
+    phantom triggers made modals pop open and toggles flip by themselves.
+    """
+    try:
+        if not ctx.triggered:
+            return False
+        for item in ctx.triggered:
+            val = item.get("value")
+            if val is None:
+                continue
+            if isinstance(val, list):
+                if any(isinstance(v, (int, float)) and v > 0 for v in val):
+                    return True
+            elif isinstance(val, (int, float)) and val > 0:
+                return True
+            elif isinstance(val, str) and val.isdigit() and int(val) > 0:
+                return True
+        return False
+    except Exception:
+        return True
+
 # -------------------------------------------------------------
 # PAGE 1: OVERVIEW DASHBOARD
 # -------------------------------------------------------------
 
-def page_overview():
-    kpis = db_adapter.get_overview_kpis()
-    trend_df = db_adapter.get_trend_history()
-    health = db_adapter.get_project_health()
-    recent_execs = db_adapter.get_recent_executions()
-
-    # 1. Top KPI Row (6 cards matching Screen 1)
+def _build_kpi_cols(kpis):
+    """Builds the 8 KPI metric pill cards from a kpis dict."""
     kpi_cards = [
-        ("Projects", kpis["projects_count"], "bi bi-layers", "#EFF6FF", "#2563EB"),
-        ("Tables", kpis["tables_count"], "bi bi-table", "#FAF5FF", "#9333EA"),
-        ("PASS", kpis["pass_count"], "bi bi-check-circle-fill", "#DCFCE7", "#15803D"),
-        ("FAIL", kpis["fail_count"], "bi bi-x-circle-fill", "#FEE2E2", "#B91C1C"),
-        ("ERROR", kpis["error_count"], "bi bi-exclamation-triangle-fill", "#FEF3C7", "#B45309"),
-        ("DQ Score", f"{int(kpis['dq_score'])}%", "bi bi-shield-check", "#CCFBF1", "#0F766E"),
+        ("Total Projects",      kpis["projects_count"],     "bi bi-layers",                   "#EFF6FF", "#2563EB"),
+        ("Registered Datasets", kpis["tables_count"],       "bi bi-table",                    "#FAF5FF", "#9333EA"),
+        ("Active Rules",        kpis["active_rules_count"], "bi bi-book",                     "#F1F5F9", "#475569"),
+        ("Total Executions",    kpis["executions_count"],   "bi bi-play-circle",              "#E0F2FE", "#0369A1"),
+        ("PASS",                kpis["pass_count"],         "bi bi-check-circle-fill",        "#DCFCE7", "#15803D"),
+        ("FAIL",                kpis["fail_count"],         "bi bi-x-circle-fill",            "#FEE2E2", "#B91C1C"),
+        ("ERROR",               kpis["error_count"],        "bi bi-exclamation-triangle-fill","#FEF3C7", "#B45309"),
+        ("Overall DQ Score",    f"{kpis['dq_score']:.1f}%", "bi bi-shield-check",             "#CCFBF1", "#0F766E"),
     ]
-
-    kpi_cols = [
+    return [
         dbc.Col(
             html.Div([
                 html.Div([
                     html.Div(title, className="metric-title"),
                     html.Div(str(val), className="metric-val"),
                 ]),
-                html.Div(
-                    html.I(className=icon, style={"color": fg}),
-                    className="metric-icon-box",
-                    style={"backgroundColor": bg},
-                ),
+                html.Div(html.I(className=icon, style={"color": fg}),
+                         className="metric-icon-box", style={"backgroundColor": bg}),
             ], className="metric-pill-card"),
-            xs=12, sm=6, md=4, lg=2, className="mb-3",
+            xs=12, sm=6, md=3, className="mb-3",
         )
         for title, val, icon, bg, fg in kpi_cards
     ]
 
-    # 2. Middle Row: Trend Line Chart (65%) & Project Health Donut (35%)
+
+
+
+def _build_overview_exec_rows(recent_execs):
+    """Builds <tr> elements for the Recent Executions table."""
+    rows = []
+    for _, row in recent_execs.iterrows():
+        s = str(row["Status"])
+        b_cls = "badge-pass" if s == "PASS" else ("badge-fail" if s == "FAIL" else "badge-error")
+        rows.append(html.Tr([
+            html.Td(str(row.get("Time", "—")), style={"fontSize": "0.82rem"}),
+            html.Td(str(row.get("Project", "—")), style={"fontWeight": "500"}),
+            html.Td(str(row.get("Dataset", "—"))),
+            html.Td(html.Span(s, className=b_cls)),
+            html.Td(str(row.get("DQ Score", "—")), style={"fontWeight": "600", "color": "#0F172A"}),
+        ]))
+    return rows or [html.Tr([html.Td("No executions yet.", colSpan=5,
+                                      className="text-center text-muted")])]
+
+
+def _build_critical_failures(proj=None, ds=None):
+    """Returns live critical failure summary panel with optional project and dataset filters."""
+    sql = """
+        SELECT project_name, dataset_name, rule_name, severity, failure_count
+        FROM dq_alerts
+        WHERE status = 'Active' AND severity IN ('Critical','High')
+    """
+    params = []
+    if proj and proj != "All":
+        sql += " AND project_name = ?"
+        params.append(proj)
+    if ds and ds != "All":
+        sql += " AND dataset_name = ?"
+        params.append(ds)
+    sql += " ORDER BY alert_id DESC LIMIT 5"
+    df = db_adapter.query_df(sql, tuple(params))
+    if df.empty:
+        return html.Div([
+            html.I(className="bi bi-check-circle-fill text-success",
+                   style={"fontSize": "1.8rem", "marginBottom": "8px"}),
+            html.Div("No critical issues", style={"fontWeight": "600", "color": "#15803D"}),
+        ], style={"padding": "24px", "backgroundColor": "#F0FDF4",
+                  "borderRadius": "8px", "border": "1px solid #DCFCE7", "textAlign": "center"})
+
+    items = []
+    for _, r in df.iterrows():
+        sev = str(r.get("severity", "High"))
+        color = "#B91C1C" if sev == "Critical" else "#B45309"
+        items.append(html.Div([
+            html.Span(sev, className="badge-fail me-2", style={"fontSize": "0.7rem"}),
+            html.Span(f"{r['project_name']} / {r['rule_name']}",
+                      style={"fontSize": "0.82rem", "fontWeight": "600", "color": color}),
+        ], className="mb-2 p-2 rounded",
+           style={"backgroundColor": "#FEF2F2", "border": "1px solid #FEE2E2"}))
+
+    items.append(html.A([
+        "View All Alerts ", html.I(className="bi bi-arrow-right"),
+    ], href="/alerts",
+       style={"color": "#2563EB", "fontSize": "0.85rem", "fontWeight": "600",
+              "textDecoration": "none", "display": "block", "marginTop": "8px"}))
+    return html.Div(items)
+
+
+
+def _overview_figures(proj=None, ds=None):
+    """Computes every live Overview widget for the given project/dataset filter."""
+    kpis = db_adapter.get_overview_kpis(proj, ds)
+    trend_df = db_adapter.get_trend_history(proj, ds)
+    health = db_adapter.get_project_health(proj, ds)
+    recent_execs = db_adapter.get_recent_executions(15, proj, ds)
+    scores_df = db_adapter.get_project_scores(proj)
+
     fig_trend = go.Figure()
     fig_trend.add_trace(go.Scatter(
         x=trend_df["Date"], y=trend_df["DQ Score"],
         mode="lines+markers", name="DQ Score",
         line=dict(color="#2563EB", width=2.5),
-        marker=dict(size=6, color="#2563EB")
+        marker=dict(size=6, color="#2563EB"),
     ))
     fig_trend.add_trace(go.Scatter(
         x=trend_df["Date"], y=trend_df["Target"],
         mode="lines", name="Target (95%)",
-        line=dict(color="#94A3B8", width=1.5, dash="dash")
+        line=dict(color="#94A3B8", width=1.5, dash="dash"),
     ))
+    y_min = min([60.0] + [float(v) for v in trend_df["DQ Score"].tolist() if v is not None])
     fig_trend.update_layout(
-        margin=dict(l=40, r=20, t=10, b=30),
-        height=260,
-        plot_bgcolor="#FFFFFF",
-        paper_bgcolor="#FFFFFF",
+        margin=dict(l=40, r=20, t=10, b=40), height=260,
+        plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        yaxis=dict(range=[60, 102], gridcolor="#F1F5F9", ticksuffix="%"),
-        xaxis=dict(gridcolor="#F1F5F9"),
+        yaxis=dict(range=[max(0, y_min - 5), 102], gridcolor="#F1F5F9", ticksuffix="%"),
+        xaxis=dict(
+            gridcolor="#F1F5F9",
+            type="category",
+            categoryorder="array",
+            categoryarray=trend_df["Date"].tolist(),
+            tickangle=-30
+        ),
     )
 
-    # Donut Chart
     fig_donut = go.Figure(data=[go.Pie(
-        labels=["Healthy", "At Risk", "Critical"],
-        values=[health["healthy"], health["at_risk"], health["critical"]],
+        labels=["Healthy (>=90%)", "At Risk (70-90%)", "Critical (<70%)"],
+        values=[max(health["healthy"], 0), max(health["at_risk"], 0), max(health["critical"], 0)],
         hole=0.72,
         marker=dict(colors=["#10B981", "#F59E0B", "#EF4444"]),
-        textinfo="none",
-        sort=False,
+        textinfo="none", sort=False,
     )])
     fig_donut.update_layout(
-        margin=dict(l=10, r=10, t=10, b=10),
-        height=220,
-        showlegend=True,
+        margin=dict(l=10, r=10, t=10, b=10), height=220, showlegend=True,
         legend=dict(orientation="v", yanchor="middle", y=0.5, xanchor="left", x=1.0),
-        annotations=[dict(text=f"<b>{health['health_score']}%</b>", x=0.35, y=0.5, font_size=24, font_family="Inter", showarrow=False, font_color="#0F172A")],
+        annotations=[dict(text=f"<b>{health['health_score']}%</b>", x=0.35, y=0.5, font_size=24,
+                          font_family="Inter", showarrow=False, font_color="#0F172A")],
         paper_bgcolor="#FFFFFF",
     )
 
-    # 3. Bottom Row: Recent Executions Table & Recent Critical Failures
-    exec_rows = []
-    for _, row in recent_execs.iterrows():
-        s = str(row["Status"])
-        b_class = "badge-pass" if s == "PASS" else ("badge-fail" if s == "FAIL" else "badge-error")
-        exec_rows.append(html.Tr([
-            html.Td(row["Time"]),
-            html.Td(row["Project"], style={"fontWeight": "500"}),
-            html.Td(html.Span(s, className=b_class)),
-            html.Td(row["DQ Score"], style={"fontWeight": "600", "color": "#0F172A"}),
-        ]))
+    if scores_df is not None and not scores_df.empty:
+        sdf = scores_df.copy()
+        if "avg_score" not in sdf.columns:
+            if "dq_score" in sdf.columns:
+                sdf["avg_score"] = sdf["dq_score"]
+            else:
+                sdf["avg_score"] = 0.0
+
+        if proj and proj != "All" and "project_name" in sdf.columns:
+            sdf = sdf[sdf["project_name"] == proj]
+            sdf["label"] = sdf["dataset_name"] if "dataset_name" in sdf.columns else sdf["project_name"]
+        else:
+            if "project_name" in sdf.columns:
+                sdf = sdf.groupby("project_name", as_index=False)["avg_score"].mean()
+                sdf["label"] = sdf["project_name"]
+            else:
+                sdf["label"] = "Project"
+
+        sdf["avg_score"] = pd.to_numeric(sdf["avg_score"], errors="coerce").fillna(0.0)
+        sdf = sdf.sort_values("avg_score")
+        colors = ["#10B981" if v >= 90 else ("#F59E0B" if v >= 70 else "#EF4444") for v in sdf["avg_score"]]
+        fig_bar = go.Figure(go.Bar(
+            x=sdf["avg_score"],
+            y=sdf["label"],
+            orientation="h",
+            marker_color=colors,
+            text=[f"{v:.1f}%" for v in sdf["avg_score"]],
+            textposition="outside"
+        ))
+    else:
+        fig_bar = go.Figure()
+    fig_bar.update_layout(margin=dict(l=10, r=30, t=10, b=30), height=260,
+                          plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
+                          xaxis=dict(range=[0, 110], ticksuffix="%", gridcolor="#F1F5F9"))
+
+    now_str = f" Last Updated: {datetime.now().strftime('%d %b %Y, %I:%M:%S %p')}"
+    return (
+        dbc.Row(_build_kpi_cols(kpis), className="g-3 mb-3"),
+        fig_trend,
+        fig_donut,
+        fig_bar,
+        _build_overview_exec_rows(recent_execs),
+        _build_critical_failures(proj, ds),
+        now_str,
+    )
+
+
+def page_overview():
+    projects = db_adapter.get_projects_list()["project_name"].tolist()
+    kpi_row, fig_trend, fig_donut, fig_bar, exec_rows, crit, now_str = _overview_figures()
 
     return html.Div([
-        # Header Bar
+        # Auto-refresh interval — fires every 5s while on the Overview page
+        dcc.Interval(id="overview-interval", interval=5000, n_intervals=0),
+
         html.Div([
-            html.H3([
-                html.I(className="bi bi-speedometer2 text-primary"),
-                "Overview Dashboard"
-            ], className="page-main-title"),
+            html.H3([html.I(className="bi bi-speedometer2 text-primary"), "Overview Dashboard"],
+                    className="page-main-title"),
             html.Div([
-                html.I(className="bi bi-calendar3"),
-                f"Last Updated: {datetime.now().strftime('%d %b %Y, %I:%M %p')}",
-            ], className="header-meta"),
+                dbc.Select(id="overview-filter-project",
+                           options=[{"label": "Project: All", "value": "All"}] + [{"label": p, "value": p} for p in projects],
+                           value="All", size="sm", style={"width": "160px"}, className="me-2"),
+                dbc.Select(id="overview-filter-dataset", options=[{"label": "Dataset: All", "value": "All"}],
+                           value="All", size="sm", style={"width": "170px"}, className="me-2"),
+                dbc.Button([html.I(className="bi bi-arrow-clockwise me-1"), "Refresh Now"],
+                           id="btn-overview-refresh", size="sm", color="primary", outline=True, className="me-3"),
+                html.Div([
+                    html.I(className="bi bi-calendar3"),
+                    html.Span(id="overview-last-updated", children=now_str),
+                ], className="header-meta"),
+            ], className="d-flex align-items-center"),
         ], className="page-header-bar"),
 
-        # Top 6 KPI Cards
-        dbc.Row(kpi_cols, className="g-3 mb-3"),
+        html.Div(id="overview-kpi-row", children=kpi_row),
 
-        # Middle Row: Trend & Donut
         dbc.Row([
-            dbc.Col(
-                html.Div([
-                    html.Div("Data Quality Trend", className="dq-card-title"),
-                    dcc.Graph(figure=fig_trend, config={"displayModeBar": False}),
-                ], className="dq-card"),
-                lg=7, className="mb-4",
-            ),
-            dbc.Col(
-                html.Div([
-                    html.Div("Project Health", className="dq-card-title"),
-                    dcc.Graph(figure=fig_donut, config={"displayModeBar": False}),
-                ], className="dq-card"),
-                lg=5, className="mb-4",
-            ),
+            dbc.Col(html.Div([
+                html.Div("Data Quality Trend", className="dq-card-title"),
+                dcc.Graph(id="overview-trend-chart", figure=fig_trend, config={"displayModeBar": False}),
+            ], className="dq-card"), lg=7, className="mb-4"),
+            dbc.Col(html.Div([
+                html.Div("Project Health", className="dq-card-title"),
+                dcc.Graph(id="overview-donut-chart", figure=fig_donut, config={"displayModeBar": False}),
+            ], className="dq-card"), lg=5, className="mb-4"),
         ], className="g-3"),
 
-        # Bottom Row: Executions & Failures
         dbc.Row([
-            dbc.Col(
-                html.Div([
-                    html.Div("Recent Executions", className="dq-card-title"),
-                    html.Table([
-                        html.Thead(html.Tr([
-                            html.Th("Time"),
-                            html.Th("Project"),
-                            html.Th("Status"),
-                            html.Th("DQ Score"),
-                        ])),
-                        html.Tbody(exec_rows),
-                    ], className="clean-table"),
-                ], className="dq-card"),
-                lg=8, className="mb-4",
-            ),
-            dbc.Col(
-                html.Div([
-                    html.Div("Recent Critical Failures", className="dq-card-title"),
-                    html.Div([
-                        html.Div(
-                            html.I(className="bi bi-exclamation-triangle-fill text-danger", style={"fontSize": "1.8rem"}),
-                            style={"marginBottom": "12px"}
-                        ),
-                        html.Div("1 project has critical issues", style={"fontWeight": "600", "color": "#1E293B", "marginBottom": "6px"}),
-                        html.A([
-                            "View Details ",
-                            html.I(className="bi bi-arrow-right"),
-                        ], href="/alerts", style={"color": "#2563EB", "fontSize": "0.88rem", "fontWeight": "600", "textDecoration": "none"}),
-                    ], style={"padding": "24px", "backgroundColor": "#FEF2F2", "borderRadius": "8px", "border": "1px solid #FEE2E2", "textAlign": "center"}),
-                ], className="dq-card"),
-                lg=4, className="mb-4",
-            ),
+            dbc.Col(html.Div([
+                html.Div("Project-wise DQ Score", className="dq-card-title"),
+                dcc.Graph(id="overview-project-score-chart", figure=fig_bar, config={"displayModeBar": False}),
+            ], className="dq-card"), lg=5, className="mb-4"),
+            dbc.Col(html.Div([
+                html.Div("Recent Executions", className="dq-card-title"),
+                html.Table([
+                    html.Thead(html.Tr([html.Th("Execution Date & Time"), html.Th("Project"), html.Th("Dataset"),
+                                        html.Th("Status"), html.Th("DQ Score")])),
+                    html.Tbody(id="overview-recent-exec-body", children=exec_rows),
+                ], className="clean-table"),
+            ], className="dq-card"), lg=7, className="mb-4"),
+        ], className="g-3"),
+
+        dbc.Row([
+            dbc.Col(html.Div([
+                html.Div("Recent Critical Failures / Active Alerts", className="dq-card-title"),
+                html.Div(id="overview-critical-failures", children=crit),
+            ], className="dq-card"), lg=12, className="mb-4"),
         ], className="g-3"),
     ])
+
+
 
 # -------------------------------------------------------------
 # PAGE 2: PROJECT & DATASET MANAGEMENT
 # -------------------------------------------------------------
 
+"""
+Draft of enhanced Page 2 (Projects & Datasets) layout and callbacks.
+"""
+from dash import html, dcc, Input, Output, State, ctx, dash_table
+import dash_bootstrap_components as dbc
+import db_adapter
+
 def _build_management_table_rows(projects_df):
-    """
-    Build the list of <tr> elements for the projects management table.
-    Extracted as a standalone helper so the refresh callback can call it
-    without re-rendering the full page layout.
-    """
     rows = []
     for _, p in projects_df.iterrows():
         p_id = int(p["project_id"])
@@ -673,6 +961,8 @@ def _build_management_table_rows(projects_df):
         toggle_label = "Disable" if is_active else "Enable"
         owner_name = p.get("owner") or "Data Engineering Team"
         ds_count = int(p.get("dataset_count", 0))
+        rules_count = int(p.get("rules_count", 0))
+        updated_at = str(p.get("updated_at") or "—")
 
         rows.append(html.Tr([
             html.Td([
@@ -680,11 +970,9 @@ def _build_management_table_rows(projects_df):
                     html.I(className="bi bi-folder-fill text-primary me-2"),
                     html.Span(p["project_name"], style={"fontWeight": "600", "fontSize": "0.95rem"}),
                 ]),
-                html.Div(f"Owner: {owner_name}", className="small text-muted ps-4"),
+                html.Div(p["description"] or "—", className="small text-muted ps-4"),
             ]),
-            html.Td(p["description"] or "—"),
             html.Td(owner_name),
-            # Dataset count badge
             html.Td(
                 html.Span(
                     f"{ds_count} dataset{'s' if ds_count != 1 else ''}",
@@ -692,7 +980,15 @@ def _build_management_table_rows(projects_df):
                     style={"fontSize": "0.78rem"},
                 )
             ),
+            html.Td(
+                html.Span(
+                    f"{rules_count} rule{'s' if rules_count != 1 else ''}",
+                    className="badge text-bg-info text-white px-2 py-1",
+                    style={"fontSize": "0.78rem"},
+                )
+            ),
             html.Td(status_badge),
+            html.Td(updated_at, style={"fontSize": "0.78rem"}),
             html.Td([
                 html.A("View", href="#", id={"type": "btn-view-proj", "id": p_id},
                        className="text-primary me-2",
@@ -702,17 +998,25 @@ def _build_management_table_rows(projects_df):
                        className="text-secondary me-2",
                        style={"textDecoration": "none", "cursor": "pointer", "fontWeight": "600"}),
                 html.Span("|", className="text-muted me-2"),
+                html.A("Add Dataset", href="#", id={"type": "btn-open-add-ds", "id": p_id},
+                       className="text-info me-2",
+                       style={"textDecoration": "none", "cursor": "pointer", "fontWeight": "600"}),
+                html.Span("|", className="text-muted me-2"),
                 html.A(toggle_label, href="#", id={"type": "btn-toggle-proj", "id": p_id},
                        className="text-danger" if is_active else "text-success",
                        style={"textDecoration": "none", "cursor": "pointer", "fontWeight": "600"}),
             ]),
         ]))
-    return rows
+    return rows or [html.Tr([html.Td("No projects match the filter.", colSpan=7, className="text-center text-muted")])]
 
 
 def page_management():
     projects_df = db_adapter.get_projects_list()
     rows = _build_management_table_rows(projects_df)
+    proj_options = [
+        {"label": r["project_name"], "value": int(r["project_id"])}
+        for _, r in projects_df.iterrows()
+    ] if not projects_df.empty else [{"label": "Hospital", "value": 1}]
 
     return html.Div([
         # Header Bar
@@ -721,29 +1025,56 @@ def page_management():
                 html.I(className="bi bi-layers text-primary"),
                 "Projects & Dataset Management"
             ], className="page-main-title"),
-            dbc.Button([
-                html.I(className="bi bi-plus-lg"),
-                "Add Project"
-            ], id="btn-open-add-project", className="btn-primary-action"),
+            html.Div([
+                dbc.Input(
+                    id="input-search-project",
+                    placeholder="Search projects...",
+                    type="text",
+                    size="sm",
+                    style={"width": "200px"},
+                    className="me-2",
+                    debounce=True,
+                ),
+                dbc.Select(
+                    id="filter-project-status",
+                    options=[
+                        {"label": "Status: All", "value": "All"},
+                        {"label": "Active", "value": "Active"},
+                        {"label": "Inactive", "value": "Inactive"},
+                    ],
+                    value="All",
+                    size="sm",
+                    style={"width": "140px"},
+                    className="me-3",
+                ),
+                dbc.Button([
+                    html.I(className="bi bi-cloud-arrow-up me-1"),
+                    "Register Dataset"
+                ], id="btn-open-register-dataset", color="outline-primary", size="sm", className="me-2 rounded-pill px-3 fw-semibold"),
+                dbc.Button([
+                    html.I(className="bi bi-plus-lg me-1"),
+                    "Add Project"
+                ], id="btn-open-add-project", className="btn-primary-action"),
+            ], className="d-flex align-items-center"),
         ], className="page-header-bar"),
 
-        # Projects Table Card — tbody uses id="management-table-body" so the
-        # refresh callback can update it in-place after Add / Edit / Toggle.
+        # Projects Table Card
         html.Div([
-            html.Table([
+            html.Div(html.Table([
                 html.Thead(html.Tr([
-                    html.Th("Project Name"),
-                    html.Th("Description"),
-                    html.Th("Project Owner"),
+                    html.Th("Project Name & Description"),
+                    html.Th("Owner"),
                     html.Th("Datasets"),
+                    html.Th("Configured Rules"),
                     html.Th("Status"),
+                    html.Th("Last Updated"),
                     html.Th("Actions"),
                 ])),
                 html.Tbody(rows, id="management-table-body"),
-            ], className="clean-table"),
+            ], className="clean-table"), style={"overflowX": "auto"}),
         ], className="dq-card mb-4"),
 
-        # Add Project Modal (Matching Screen Images)
+        # Add Project Modal
         dbc.Modal([
             dbc.ModalHeader([
                 html.Div([
@@ -753,45 +1084,52 @@ def page_management():
             ], close_button=True),
             dbc.ModalBody([
                 dbc.Form([
-                    # Section 1: PROJECT DETAILS
                     html.Div("PROJECT DETAILS", className="fw-bold text-muted small mb-3", style={"letterSpacing": "0.05em"}),
                     html.Div([
                         dbc.Label("Project Name *", className="small fw-semibold text-secondary mb-1"),
-                        dbc.Input(id="new-project-name", placeholder="e.g. Banking", type="text", className="rounded-pill px-3 py-2"),
+                        dbc.Input(id="new-project-name", placeholder="e.g. Banking_DQ_Project", type="text", className="rounded-pill px-3 py-2"),
                     ], className="mb-3"),
                     html.Div([
                         dbc.Label("Description", className="small fw-semibold text-secondary mb-1"),
-                        dbc.Input(id="new-project-desc", placeholder="Customer transaction data quality", type="text", className="rounded-pill px-3 py-2"),
+                        dbc.Input(id="new-project-desc", placeholder="Customer transaction data quality validation", type="text", className="rounded-pill px-3 py-2"),
                     ], className="mb-3"),
                     html.Div([
                         dbc.Label("Project Owner", className="small fw-semibold text-secondary mb-1"),
                         dbc.Input(id="new-project-owner", placeholder="Team or owner name", type="text", className="rounded-pill px-3 py-2"),
+                    ], className="mb-4"),
+
+                    html.Div("PROJECT NOTIFICATION DETAILS", className="fw-bold text-muted small mb-3", style={"letterSpacing": "0.05em"}),
+                    html.Div([
+                        dbc.Label("Project Team Email Address *", className="small fw-semibold text-secondary mb-1"),
+                        dbc.Input(id="new-project-team-email", placeholder="e.g. dataquality-team@company.com", type="email", className="rounded-pill px-3 py-2"),
+                        html.Small("Primary notification recipient (Mandatory). Comma-separated if multiple.", className="text-muted small"),
                     ], className="mb-3"),
                     html.Div([
-                        dbc.Label("Business Domain", className="small fw-semibold text-secondary mb-1"),
-                        dbc.Select(
-                            id="new-project-domain",
-                            options=[
-                                {"label": "Banking", "value": "Banking"},
-                                {"label": "Healthcare", "value": "Healthcare"},
-                                {"label": "Logistics & Supply Chain", "value": "Logistics"},
-                                {"label": "Sales & CRM", "value": "Sales"},
-                                {"label": "Retail & E-Commerce", "value": "Retail"},
-                                {"label": "Finance & Billing", "value": "Finance"},
-                            ],
-                            value="Banking",
-                            className="rounded-pill px-3 py-2",
+                        dbc.Label("Additional Notification Emails (Optional)", className="small fw-semibold text-secondary mb-1"),
+                        dbc.Input(id="new-project-additional-emails", placeholder="e.g. alerts-oncall@company.com, lead@company.com", type="text", className="rounded-pill px-3 py-2"),
+                        html.Small("Optional secondary stakeholders who receive failure alerts.", className="text-muted small"),
+                    ], className="mb-3"),
+                    html.Div([
+                        dbc.Checklist(
+                            options=[{"label": " Enable Email Notifications for DQ Failures", "value": "enabled"}],
+                            value=["enabled"],
+                            id="new-project-notif-enabled",
+                            switch=True,
+                            className="fw-semibold text-dark",
                         ),
                     ], className="mb-4"),
 
-                    # Section 2: DATASET DETAILS
-                    html.Div("DATASET DETAILS", className="fw-bold text-muted small mb-3", style={"letterSpacing": "0.05em"}),
+                    html.Div("INITIAL DATASET DETAILS", className="fw-bold text-muted small mb-3", style={"letterSpacing": "0.05em"}),
+                    html.Div([
+                        dbc.Label("Dataset Name (Optional)", className="small fw-semibold text-secondary mb-1"),
+                        dbc.Input(id="new-project-dataset-name", placeholder="Leave blank to use table name", type="text", className="rounded-pill px-3 py-2"),
+                    ], className="mb-3"),
                     html.Div([
                         dbc.Label("Source Table *", className="small fw-semibold text-secondary mb-1"),
                         dbc.Input(id="new-project-source-table", placeholder="catalog.schema.source_table", type="text", className="rounded-pill px-3 py-2"),
                     ], className="mb-3"),
                     html.Div([
-                        dbc.Label("Target Table", className="small fw-semibold text-secondary mb-1"),
+                        dbc.Label("Target Table (Optional for Reconciliation)", className="small fw-semibold text-secondary mb-1"),
                         dbc.Input(id="new-project-target-table", placeholder="catalog.schema.target_table", type="text", className="rounded-pill px-3 py-2"),
                     ], className="mb-3"),
                     html.Div([
@@ -799,7 +1137,6 @@ def page_management():
                         dbc.Input(id="new-project-business-key", placeholder="e.g. customer_id", type="text", className="rounded-pill px-3 py-2"),
                     ], className="mb-3"),
 
-                    # Test Connectivity action
                     html.Div([
                         dbc.Button([
                             html.I(className="bi bi-check2-circle me-1"),
@@ -817,12 +1154,338 @@ def page_management():
             ]),
         ], id="modal-add-project", is_open=False, size="lg"),
 
+        # Upgraded Register Dataset Modal (Two Options: Local File Upload & Existing Databricks Table)
+        dbc.Modal([
+            dbc.ModalHeader([
+                html.Div([
+                    html.H5([
+                        html.I(className="bi bi-database-add text-primary me-2"),
+                        "Register New Dataset"
+                    ], className="fw-bold mb-1 text-dark"),
+                    html.Div("Onboard a new dataset via local file upload (CSV, JSON, Parquet, Excel) or register an existing Unity Catalog Delta table.",
+                             className="text-muted small"),
+                ]),
+            ], close_button=True),
+            dbc.ModalBody([
+                dcc.Store(id="add-dataset-project-id"),
+                dcc.Store(id="upload-file-store"),
+
+                # 1. Main Form Container
+                html.Div(id="dataset-registration-form-container", children=[
+                    # Target Project Selector
+                    dbc.Row([
+                        dbc.Col([
+                            dbc.Label(["Target Project ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                            dbc.Select(
+                                id="select-dataset-target-project",
+                                options=proj_options,
+                                value=proj_options[0]["value"] if proj_options else 1,
+                                className="rounded-pill px-3 py-2",
+                            ),
+                        ], md=6, className="mb-3"),
+                        dbc.Col([
+                            dbc.Label("Active Environment / Catalog", className="small fw-semibold text-secondary mb-1"),
+                            html.Div([
+                                html.Span(html.I(className="bi bi-circle-fill text-success me-1", style={"fontSize": "0.6rem"})),
+                                html.Span("Unity Catalog: hospital_catalog.healthcare", className="fw-semibold small text-dark"),
+                            ], className="p-2 border rounded-pill bg-light d-flex align-items-center"),
+                        ], md=6, className="mb-3"),
+                    ]),
+
+                    # Method Selection Cards (Option 1 vs Option 2)
+                    html.Div("SELECT REGISTRATION METHOD", className="fw-bold text-muted small mb-2", style={"letterSpacing": "0.05em"}),
+                    dbc.RadioItems(
+                        id="dataset-reg-method",
+                        className="btn-group w-100 mb-4",
+                        inputClassName="btn-check",
+                        labelClassName="btn btn-outline-primary py-3 px-4 text-start rounded-3 me-2",
+                        labelCheckedClassName="active shadow-sm",
+                        options=[
+                            {
+                                "label": html.Div([
+                                    html.Div([
+                                        html.I(className="bi bi-cloud-arrow-up-fill fs-5 me-2 text-primary"),
+                                        html.Span("Option 1: Upload Dataset", className="fw-bold"),
+                                        html.Span("Recommended for new users", className="badge bg-primary text-white ms-2 small"),
+                                    ], className="d-flex align-items-center mb-1"),
+                                    html.Div("Upload a new dataset from your local computer (CSV, JSON, Parquet, Excel). Automatically creates Delta table.", className="small text-muted"),
+                                ]),
+                                "value": "upload"
+                            },
+                            {
+                                "label": html.Div([
+                                    html.Div([
+                                        html.I(className="bi bi-table fs-5 me-2 text-secondary"),
+                                        html.Span("Option 2: Existing Databricks Table", className="fw-bold"),
+                                        html.Span("For existing datasets", className="badge bg-secondary text-white ms-2 small"),
+                                    ], className="d-flex align-items-center mb-1"),
+                                    html.Div("Register a table that already exists in Unity Catalog without uploading or copying the data.", className="small text-muted"),
+                                ]),
+                                "value": "existing"
+                            },
+                        ],
+                        value="upload",
+                    ),
+
+                    # ── OPTION 1: UPLOAD DATASET WORKFLOW ─────────────────────────
+                    html.Div(id="container-upload-dataset", children=[
+                        # File Upload Drag-and-Drop Area
+                        dcc.Upload(
+                            id="upload-dataset-file",
+                            children=html.Div([
+                                html.I(className="bi bi-cloud-arrow-up text-primary mb-2", style={"fontSize": "2.5rem"}),
+                                html.Div([
+                                    html.Span("Drag and drop your dataset file here, or ", className="text-secondary fw-semibold"),
+                                    html.Span("Browse Computer", className="text-primary fw-bold text-decoration-underline"),
+                                ]),
+                                html.Div("Supported file formats: CSV, JSON, Parquet, Excel (.xlsx, .xls) • Max 50MB", className="text-muted small mt-1"),
+                            ], className="text-center p-4"),
+                            style={
+                                "borderWidth": "2px",
+                                "borderStyle": "dashed",
+                                "borderColor": "#3B82F6",
+                                "borderRadius": "12px",
+                                "backgroundColor": "#F8FAFC",
+                                "cursor": "pointer",
+                                "transition": "all 0.2s ease-in-out",
+                            },
+                            multiple=False,
+                        ),
+
+                        # Preview and Detected Schema Container
+                        html.Div(id="upload-preview-container", className="mt-3"),
+
+                        # Configuration Fields for Uploaded File
+                        html.Div([
+                            html.Div("DATASET & TABLE CONFIGURATION", className="fw-bold text-muted small mt-4 mb-3", style={"letterSpacing": "0.05em"}),
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.Label(["Dataset Name ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                                    dbc.Input(id="input-upload-dataset-name", placeholder="e.g. Insurance_Claims", type="text", className="rounded-pill px-3 py-2"),
+                                ], md=6, className="mb-3"),
+                                dbc.Col([
+                                    dbc.Label(["Business Key Column ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                                    dbc.Select(id="select-upload-business-key", placeholder="Select unique identifier", options=[], className="rounded-pill px-3 py-2"),
+                                ], md=6, className="mb-3"),
+                            ]),
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.Label(["Destination Catalog ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                                    dbc.Input(id="input-upload-catalog", placeholder="insurance_catalog", value="hospital_catalog", type="text", className="rounded-pill px-3 py-2"),
+                                ], md=4, className="mb-3"),
+                                dbc.Col([
+                                    dbc.Label(["Destination Schema ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                                    dbc.Input(id="input-upload-schema", placeholder="claims", value="healthcare", type="text", className="rounded-pill px-3 py-2"),
+                                ], md=4, className="mb-3"),
+                                dbc.Col([
+                                    dbc.Label(["Table Name ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                                    dbc.Input(id="input-upload-table-name", placeholder="claims_source", type="text", className="rounded-pill px-3 py-2"),
+                                ], md=4, className="mb-3"),
+                            ]),
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.Label("Target Table (Optional for Source-to-Target Reconciliation)", className="small fw-semibold text-secondary mb-1"),
+                                    dbc.Input(id="input-upload-target-table", placeholder="catalog.schema.claims_target", type="text", className="rounded-pill px-3 py-2"),
+                                ], md=6, className="mb-3"),
+                                dbc.Col([
+                                    dbc.Label("Description", className="small fw-semibold text-secondary mb-1"),
+                                    dbc.Input(id="input-upload-description", placeholder="Insurance claim records", type="text", className="rounded-pill px-3 py-2"),
+                                ], md=6, className="mb-3"),
+                            ]),
+                            html.Div(id="upload-submit-alert", className="mt-2"),
+                            html.Div([
+                                dbc.Button([
+                                    html.I(className="bi bi-cloud-arrow-up-fill me-2"),
+                                    "Upload & Create Delta Table"
+                                ], id="btn-submit-upload-dataset", color="primary", className="rounded-pill px-4 py-2 fw-semibold shadow-sm"),
+                            ], className="d-flex justify-content-end mt-3"),
+                        ]),
+                    ]),
+
+                    # ── OPTION 2: EXISTING DATABRICKS TABLE WORKFLOW ──────────────
+                    html.Div(id="container-existing-dataset", style={"display": "none"}, children=[
+                        # 1. Databricks Authentication & Workspace Connection Bar
+                        html.Div([
+                            html.Div([
+                                html.Div([
+                                    html.Span(html.I(className="bi bi-circle-fill text-success me-2", style={"fontSize": "0.65rem"})),
+                                    html.Span("Connected Workspace: ", className="small fw-semibold text-secondary me-1"),
+                                    html.Code("dbc-9f225403-7c26.cloud.databricks.com", id="workspace-connected-host", className="text-primary fw-bold"),
+                                    html.Span(" (Unity Catalog Active)", id="workspace-connected-auth", className="text-muted small ms-2"),
+                                ], className="d-flex align-items-center"),
+                                dbc.Button([
+                                    html.I(className="bi bi-shield-lock-fill me-1"),
+                                    "Workspace Auth Settings"
+                                ], id="btn-toggle-workspace-settings", color="link", size="sm", className="p-0 text-decoration-none small fw-semibold"),
+                            ], className="d-flex justify-content-between align-items-center p-2 px-3 border rounded bg-white shadow-sm mb-3"),
+                            
+                            dbc.Collapse(
+                                id="collapse-workspace-settings",
+                                is_open=False,
+                                children=html.Div([
+                                    dbc.Row([
+                                        dbc.Col([
+                                            dbc.Label("Databricks Workspace Host URL", className="small fw-semibold text-secondary mb-1"),
+                                            dbc.Input(id="input-workspace-host", value="https://dbc-9f225403-7c26.cloud.databricks.com", type="text", className="rounded-pill px-3 py-1 small"),
+                                        ], md=6, className="mb-2"),
+                                        dbc.Col([
+                                            dbc.Label("Personal Access Token / Secret (Optional for OAuth)", className="small fw-semibold text-secondary mb-1"),
+                                            dbc.Input(id="input-workspace-token", placeholder="Leave blank to use workspace OAuth identity", type="password", className="rounded-pill px-3 py-1 small"),
+                                        ], md=4, className="mb-2"),
+                                        dbc.Col([
+                                            dbc.Button("Authenticate", id="btn-connect-workspace", color="primary", size="sm", className="rounded-pill w-100 fw-semibold mt-4"),
+                                        ], md=2, className="mb-2"),
+                                    ]),
+                                    html.Div(id="workspace-connect-alert", className="mt-1 small"),
+                                ], className="p-3 bg-light border rounded mb-3"),
+                            ),
+                        ]),
+
+                        # 2. Dynamic Unity Catalog Hierarchy Dropdowns (Catalog -> Schema -> Table)
+                        html.Div("DYNAMIC UNITY CATALOG TABLE DISCOVERY", className="fw-bold text-muted small mb-2", style={"letterSpacing": "0.05em"}),
+                        dbc.Row([
+                            dbc.Col([
+                                html.Div([
+                                    dbc.Label(["Catalog ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                                    dbc.Button(html.I(className="bi bi-arrow-clockwise"), id="btn-refresh-catalogs", size="sm", color="link", className="p-0 float-end text-muted", title="Refresh Catalogs"),
+                                ]),
+                                dbc.Select(
+                                    id="select-existing-catalog",
+                                    options=_get_initial_catalog_options(),
+                                    value="hospital_catalog",
+                                    placeholder="Select Catalog...",
+                                    className="rounded-pill px-3 py-2",
+                                ),
+                            ], md=4, className="mb-3"),
+                            dbc.Col([
+                                html.Div([
+                                    dbc.Label(["Schema ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                                    dbc.Button(html.I(className="bi bi-arrow-clockwise"), id="btn-refresh-schemas", size="sm", color="link", className="p-0 float-end text-muted", title="Refresh Schemas"),
+                                ]),
+                                dbc.Select(
+                                    id="select-existing-schema",
+                                    options=_get_initial_schema_options(),
+                                    value="healthcare",
+                                    placeholder="Select Schema...",
+                                    className="rounded-pill px-3 py-2",
+                                ),
+                            ], md=4, className="mb-3"),
+                            dbc.Col([
+                                html.Div([
+                                    dbc.Label(["Existing Table Name ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                                    dbc.Button(html.I(className="bi bi-arrow-clockwise"), id="btn-refresh-tables", size="sm", color="link", className="p-0 float-end text-muted", title="Refresh Tables"),
+                                ]),
+                                dbc.Select(
+                                    id="select-existing-table",
+                                    options=_get_initial_table_options(),
+                                    value="source_table",
+                                    placeholder="Select Table...",
+                                    className="rounded-pill px-3 py-2",
+                                ),
+                            ], md=4, className="mb-3"),
+                        ]),
+
+                        # 3. Dataset Configuration & Dynamic Business Key
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Label(["Dataset Name ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                                dbc.Input(id="input-existing-dataset-name", value="source_table", placeholder="e.g. Transactions_Master", type="text", className="rounded-pill px-3 py-2"),
+                            ], md=6, className="mb-3"),
+                            dbc.Col([
+                                dbc.Label(["Business Key Column ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                                dbc.Select(
+                                    id="select-existing-business-key",
+                                    options=_get_initial_bkey_options(),
+                                    value="patient_id",
+                                    placeholder="Select Business Key from table columns...",
+                                    className="rounded-pill px-3 py-2",
+                                ),
+                            ], md=6, className="mb-3"),
+                        ]),
+
+                        # 4. Table Preview & Detected Metadata Container
+                        html.Div(id="existing-table-preview-container", children=_get_initial_table_preview(), className="mb-3"),
+
+                        # 5. Optional Source-to-Target Reconciliation Section
+                        html.Div([
+                            dbc.Checkbox(
+                                id="toggle-existing-reconciliation",
+                                label="Enable Source-to-Target Reconciliation (Optional)",
+                                value=False,
+                                className="fw-semibold text-secondary small mb-2",
+                            ),
+                            dbc.Collapse(
+                                id="collapse-existing-reconciliation",
+                                is_open=False,
+                                children=html.Div([
+                                    dbc.Row([
+                                        dbc.Col([
+                                            dbc.Label("Target Catalog", className="small fw-semibold text-secondary mb-1"),
+                                            dbc.Select(id="select-existing-target-catalog", options=_get_initial_catalog_options(), value="hospital_catalog", placeholder="Select Target Catalog...", className="rounded-pill px-3 py-2"),
+                                        ], md=4, className="mb-2"),
+                                        dbc.Col([
+                                            dbc.Label("Target Schema", className="small fw-semibold text-secondary mb-1"),
+                                            dbc.Select(id="select-existing-target-schema", options=_get_initial_schema_options(), value="healthcare", placeholder="Select Target Schema...", className="rounded-pill px-3 py-2"),
+                                        ], md=4, className="mb-2"),
+                                        dbc.Col([
+                                            dbc.Label("Target Table", className="small fw-semibold text-secondary mb-1"),
+                                            dbc.Select(id="select-existing-target-table", options=_get_initial_table_options(), value="patients_target", placeholder="Select Target Table...", className="rounded-pill px-3 py-2"),
+                                        ], md=4, className="mb-2"),
+                                    ]),
+                                    dbc.Row([
+                                        dbc.Col([
+                                            dbc.Label("Target Business Key (Optional)", className="small fw-semibold text-secondary mb-1"),
+                                            dbc.Select(id="select-existing-target-bkey", options=_get_initial_bkey_options(tbl="patients_target"), value="patient_id", placeholder="Select Target Business Key...", className="rounded-pill px-3 py-2"),
+                                        ], md=6, className="mb-2"),
+                                    ]),
+                                ], className="p-3 bg-light border rounded mb-3"),
+                            ),
+                        ]),
+
+                        # 6. Description Row
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Label("Description", className="small fw-semibold text-secondary mb-1"),
+                                dbc.Input(id="input-existing-description", placeholder="Existing Unity Catalog dataset records", type="text", className="rounded-pill px-3 py-2"),
+                            ], md=12, className="mb-3"),
+                        ]),
+
+                        # 7. Action Buttons & Alerts
+                        html.Div([
+                            dbc.Button([
+                                html.I(className="bi bi-lightning-charge me-1"),
+                                "Test Connectivity"
+                            ], id="btn-test-existing-conn", color="outline-secondary", size="sm", className="rounded-pill px-3 me-2"),
+                            dbc.Button([
+                                html.I(className="bi bi-arrow-repeat me-1"),
+                                "Refresh Metadata"
+                            ], id="btn-refresh-existing-metadata", color="outline-secondary", size="sm", className="rounded-pill px-3"),
+                            html.Div(id="existing-connectivity-alert", className="mt-2"),
+                        ], className="mb-3"),
+                        html.Div(id="existing-submit-alert", className="mt-2"),
+                        html.Div([
+                            dbc.Button([
+                                html.I(className="bi bi-check2-circle me-2"),
+                                "Register Dataset"
+                            ], id="btn-submit-existing-dataset", color="primary", className="rounded-pill px-4 py-2 fw-semibold shadow-sm"),
+                        ], className="d-flex justify-content-end mt-3"),
+                    ]),
+                ]),
+
+                # 2. Post-Registration Status Container (Displays when registration completes)
+                html.Div(id="dataset-registration-status-card", style={"display": "none"}),
+            ]),
+            dbc.ModalFooter([
+                dbc.Button("Cancel / Close", id="btn-cancel-add-dataset", color="light", className="rounded-pill px-4"),
+            ]),
+        ], id="modal-add-dataset", is_open=False, size="xl"),
+
         # View Project Details Modal
         dbc.Modal([
             dbc.ModalHeader([
                 html.H5("Project Details", id="modal-view-project-title", className="fw-bold mb-0 text-dark"),
             ], close_button=True),
-            dbc.ModalBody(id="modal-view-project-body"),
+            dbc.ModalBody(id="modal-view-project-body", style={"maxHeight": "70vh", "overflowY": "auto"}),
             dbc.ModalFooter([
                 dbc.Button("Close", id="btn-close-view-project", color="light", className="rounded-pill px-3"),
                 dbc.Button([
@@ -830,7 +1493,7 @@ def page_management():
                     "Configure DQ Rules"
                 ], href="/rules", color="primary", className="rounded-pill px-3 fw-semibold"),
             ]),
-        ], id="modal-view-project", is_open=False, size="lg"),
+        ], id="modal-view-project", is_open=False, size="lg", scrollable=True),
 
         # Edit Project Modal
         dbc.Modal([
@@ -839,20 +1502,26 @@ def page_management():
             ], close_button=True),
             dbc.ModalBody([
                 dcc.Store(id="edit-project-id"),
-                dcc.Store(id="edit-dataset-id"),
                 html.Div([
-                    dbc.Label("Project Name", className="fw-semibold small text-secondary"),
+                    dbc.Label("Project Name *", className="fw-semibold small text-secondary"),
                     dbc.Input(id="edit-project-name", type="text", className="mb-3 rounded-pill px-3"),
                     dbc.Label("Description", className="fw-semibold small text-secondary"),
                     dbc.Input(id="edit-project-desc", type="text", className="mb-3 rounded-pill px-3"),
                     dbc.Label("Project Owner", className="fw-semibold small text-secondary"),
                     dbc.Input(id="edit-project-owner", type="text", className="mb-3 rounded-pill px-3"),
-                    dbc.Label("Source Table", className="fw-semibold small text-secondary"),
-                    dbc.Input(id="edit-project-source", type="text", className="mb-3 rounded-pill px-3"),
-                    dbc.Label("Target Table", className="fw-semibold small text-secondary"),
-                    dbc.Input(id="edit-project-target", type="text", className="mb-3 rounded-pill px-3"),
-                    dbc.Label("Business Key", className="fw-semibold small text-secondary"),
-                    dbc.Input(id="edit-project-business-key", type="text", className="mb-3 rounded-pill px-3"),
+                    html.Div("NOTIFICATION SETTINGS", className="fw-bold text-muted small mb-2 mt-3", style={"letterSpacing": "0.05em"}),
+                    dbc.Label("Project Team Email Address *", className="fw-semibold small text-secondary"),
+                    dbc.Input(id="edit-project-team-email", type="email", className="mb-2 rounded-pill px-3"),
+                    dbc.Label("Additional Notification Emails (Optional)", className="fw-semibold small text-secondary"),
+                    dbc.Input(id="edit-project-additional-emails", type="text", className="mb-3 rounded-pill px-3"),
+                    dbc.Checklist(
+                        options=[{"label": " Enable Email Notifications for DQ Failures", "value": "enabled"}],
+                        value=["enabled"],
+                        id="edit-project-notif-enabled",
+                        switch=True,
+                        className="fw-semibold text-dark mb-2",
+                    ),
+                    html.Div(id="edit-project-error-alert"),
                 ]),
             ]),
             dbc.ModalFooter([
@@ -862,44 +1531,74 @@ def page_management():
         ], id="modal-edit-project", is_open=False),
     ])
 
+
 # -------------------------------------------------------------
 # PAGE 3: RULE CONFIGURATION
 # -------------------------------------------------------------
 
-def page_rules():
-    projects = db_adapter.get_projects_list()["project_name"].tolist()
-    datasets = db_adapter.get_datasets_for_project("Hospital")
-    
-    # Template Cards matching left panel of Screen 3
-    template_tiles = []
-    icon_map = {
-        "NULL_COUNT": ("bi bi-check-circle-fill", "#2563EB", "#EFF6FF"),
-        "NULL_PERCENT": ("bi bi-percent", "#9333EA", "#FAF5FF"),
-        "UNIQUE_COUNT": ("bi bi-shield-check", "#10B981", "#DCFCE7"),
-        "DUPLICATE_COUNT": ("bi bi-copy", "#F59E0B", "#FEF3C7"),
-        "ROW_COUNT": ("bi bi-list-ol", "#06B6D4", "#ECFEFF"),
-        "BLANK_COUNT": ("bi bi-dash-circle", "#64748B", "#F1F5F9"),
-        "DATA_FRESHNESS": ("bi bi-clock-history", "#F97316", "#FFF7ED"),
-        "REFERENTIAL_INTEGRITY": ("bi bi-diagram-3-fill", "#8B5CF6", "#F5F3FF"),
-        "SCHEMA_CHANGE": ("bi bi-gear-fill", "#3B82F6", "#EFF6FF"),
-        "REQUIRED_COLUMNS": ("bi bi-ui-checks", "#10B981", "#DCFCE7"),
-        "SOURCE_TARGET_ROW_COUNT": ("bi bi-arrow-left-right", "#EC4899", "#FDF2F8"),
-    }
-    
+"""
+Enhanced Page 3 (Rule Library) layout and helper.
+"""
+from dash import html, dcc, Input, Output, State, ctx
+import dash_bootstrap_components as dbc
+import db_adapter
+from rule_engine import RULE_TEMPLATES
+
+ICON_MAP = {
+    "NULL_COUNT":                     ("bi bi-check-circle-fill", "#2563EB", "#EFF6FF"),
+    "NULL_PERCENT":                   ("bi bi-percent",           "#9333EA", "#FAF5FF"),
+    "BLANK_COUNT":                    ("bi bi-dash-circle",       "#64748B", "#F1F5F9"),
+    "REQUIRED_COLUMNS":               ("bi bi-ui-checks",         "#10B981", "#DCFCE7"),
+    "UNIQUE_COUNT":                   ("bi bi-shield-check",      "#10B981", "#DCFCE7"),
+    "DUPLICATE_COUNT":                ("bi bi-copy",              "#F59E0B", "#FEF3C7"),
+    "ROW_COUNT":                      ("bi bi-list-ol",           "#06B6D4", "#ECFEFF"),
+    "DATA_FRESHNESS":                 ("bi bi-clock-history",     "#F97316", "#FFF7ED"),
+    "REFERENTIAL_INTEGRITY":          ("bi bi-diagram-3-fill",    "#8B5CF6", "#F5F3FF"),
+    "SCHEMA_CHANGE":                  ("bi bi-gear-fill",         "#3B82F6", "#EFF6FF"),
+    "SOURCE_TARGET_ROW_COUNT":        ("bi bi-arrow-left-right",  "#EC4899", "#FDF2F8"),
+    "SOURCE_TARGET_MISSING_RECORDS":  ("bi bi-database-exclamation", "#EF4444", "#FEF2F2"),
+    "NEGATIVE_VALUE_CHECK":           ("bi bi-dash-square",       "#DC2626", "#FEE2E2"),
+    "DATE_VALIDATION":                ("bi bi-calendar-check",    "#0D9488", "#CCFBF1"),
+}
+
+def _render_template_tiles(search_filter=None):
+    tiles = []
+    q = (search_filter or "").strip().lower()
     for t_name, t_info in RULE_TEMPLATES.items():
-        icon, fg, bg = icon_map.get(t_name, ("bi bi-check-circle", "#2563EB", "#EFF6FF"))
-        template_tiles.append(
+        desc = t_info.get("description", "")
+        cat = t_info.get("category", "")
+        if q and q not in t_name.lower() and q not in desc.lower() and q not in cat.lower():
+            continue
+        icon, fg, bg = ICON_MAP.get(t_name, ("bi bi-check-circle", "#2563EB", "#EFF6FF"))
+        tiles.append(
             html.Div([
                 html.Div(
                     html.I(className=icon, style={"color": fg}),
-                    style={"width": "34px", "height": "34px", "borderRadius": "8px", "backgroundColor": bg, "display": "flex", "alignItems": "center", "justifyContent": "center", "fontSize": "1.1rem"}
+                    style={"width": "34px", "height": "34px", "borderRadius": "8px", "backgroundColor": bg,
+                           "display": "flex", "alignItems": "center", "justifyContent": "center", "fontSize": "1.1rem"}
                 ),
                 html.Div([
-                    html.Div(t_name, style={"fontWeight": "600", "fontSize": "0.85rem", "color": "#0F172A"}),
-                    html.Div(t_info["description"], style={"fontSize": "0.75rem", "color": "#64748B"}),
+                    html.Div([
+                        html.Span(t_name, style={"fontWeight": "600", "fontSize": "0.85rem", "color": "#0F172A"}),
+                        html.Span(cat, className="badge text-bg-light border text-muted ms-2", style={"fontSize": "0.68rem"}),
+                    ]),
+                    html.Div(desc, style={"fontSize": "0.75rem", "color": "#64748B"}),
                 ]),
             ], id={"type": "template-tile", "index": t_name}, className="template-tile", n_clicks=0)
         )
+    return tiles or [html.Div("No templates match your search.", className="text-muted p-2 small text-center")]
+
+
+def page_rules():
+    projects = db_adapter.get_projects_list()["project_name"].tolist()
+    first_proj = projects[0] if projects else "Hospital"
+    datasets = db_adapter.get_datasets_for_project(first_proj, include_inactive=False)
+    first_ds = datasets[0] if datasets else None
+    first_cols = db_adapter.get_table_columns(first_proj, first_ds) if (first_proj and first_ds) else []
+    col_options = [{"label": "Select a column...", "value": ""}] + [{"label": c, "value": c} for c in first_cols]
+    categories = sorted({v["category"] for v in RULE_TEMPLATES.values()})
+
+    template_tiles = _render_template_tiles()
 
     return html.Div([
         # Header Bar with Project / Dataset selectors
@@ -912,33 +1611,32 @@ def page_rules():
                 dbc.Select(
                     id="rule-select-project",
                     options=[{"label": p, "value": p} for p in projects],
-                    value="Hospital",
+                    value=first_proj,
                     style={"width": "160px"},
                     className="me-2",
                 ),
                 dbc.Select(
                     id="rule-select-dataset",
                     options=[{"label": d, "value": d} for d in datasets],
-                    value="source_table",
+                    value=datasets[0] if datasets else None,
                     style={"width": "180px"},
                     className="me-3",
                 ),
-                dbc.Button([
-                    html.I(className="bi bi-plus-lg"),
-                    "Add Rule"
-                ], id="btn-add-rule-trigger", className="btn-primary-action"),
             ], className="d-flex align-items-center"),
         ], className="page-header-bar"),
 
-        # 2-Column Layout matching Screen 3
+        # 2-Column Layout
         dbc.Row([
             # Left: Available Rule Templates
             dbc.Col([
                 html.Div([
-                    html.Div("Available Rule Templates", className="dq-card-title"),
+                    html.Div([
+                        html.Span("Available Rule Templates"),
+                        html.Span("14 Templates", className="badge text-bg-primary text-white"),
+                    ], className="dq-card-title"),
                     dbc.InputGroup([
                         dbc.InputGroupText(html.I(className="bi bi-search")),
-                        dbc.Input(id="input-search-template", placeholder="Search rules...", type="text"),
+                        dbc.Input(id="input-search-template", placeholder="Search 14 rule templates...", type="text"),
                     ], className="mb-3"),
                     html.Div(template_tiles, id="template-tiles-container", style={"maxHeight": "520px", "overflowY": "auto"}),
                 ], className="dq-card"),
@@ -947,15 +1645,38 @@ def page_rules():
             # Right: Rule Details Form
             dbc.Col([
                 html.Div([
-                    html.Div("Rule Details", className="dq-card-title"),
+                    html.Div([
+                        html.Span("Rule Configuration"),
+                        html.Span(id="rule-selected-template-badge", children="NULL_COUNT", className="badge text-bg-info text-white"),
+                    ], className="dq-card-title"),
                     dbc.Form([
                         html.Div([
                             dbc.Label("Rule Name", className="fw-semibold"),
                             dbc.Input(id="rule-input-name", value="NULL_COUNT", type="text"),
                         ], className="mb-3"),
                         html.Div([
-                            dbc.Label("Column", className="fw-semibold"),
-                            dbc.Input(id="rule-input-column", value="patient_name", type="text"),
+                            dbc.Label([
+                                "Column",
+                                html.Span(" *", id="rule-col-required-star", className="text-danger ms-1"),
+                            ], className="fw-semibold d-flex align-items-center"),
+                            dcc.Loading(
+                                id="loading-rule-columns",
+                                type="dot",
+                                children=[
+                                    dbc.Select(
+                                        id="rule-select-column",
+                                        options=col_options,
+                                        value=None,
+                                        disabled=len(first_cols) == 0,
+                                        placeholder="Select a column...",
+                                    ),
+                                ]
+                            ),
+                            html.Div(
+                                id="rule-column-status-msg",
+                                children=f"{len(first_cols)} columns available" if first_cols else "No columns found for this dataset",
+                                className="form-text text-muted small mt-1"
+                            ),
                         ], className="mb-3"),
                         html.Div([
                             dbc.Label("Threshold", className="fw-semibold"),
@@ -989,23 +1710,52 @@ def page_rules():
 
         # Configured Rules Section
         html.Div([
-            html.Div("Configured Rules", className="dq-card-title"),
-            dbc.InputGroup([
-                dbc.InputGroupText(html.I(className="bi bi-search")),
-                dbc.Input(id="input-search-rules", placeholder="Search rules...", type="text"),
-            ], className="mb-3"),
-            html.Table([
-                html.Thead(html.Tr([
-                    html.Th("Rule Name"),
-                    html.Th("Column"),
-                    html.Th("Threshold"),
-                    html.Th("Severity"),
-                    html.Th("Status"),
-                    html.Th("Created At"),
-                    html.Th("Actions"),
-                ])),
-                html.Tbody(id="configured-rules-table-body", children=[]),
-            ], className="clean-table"),
+            html.Div([
+                html.Span("Configured Rules"),
+                html.Div([
+                    dbc.Select(
+                        id="filter-rules-category",
+                        options=[{"label": "Category: All", "value": "All"}] + [{"label": c, "value": c} for c in categories],
+                        value="All",
+                        size="sm",
+                        style={"width": "150px"},
+                        className="me-2",
+                    ),
+                    dbc.Select(
+                        id="filter-rules-severity",
+                        options=[
+                            {"label": "Severity: All", "value": "All"},
+                            {"label": "Critical", "value": "Critical"},
+                            {"label": "High", "value": "High"},
+                            {"label": "Medium", "value": "Medium"},
+                            {"label": "Low", "value": "Low"},
+                        ],
+                        value="All",
+                        size="sm",
+                        style={"width": "140px"},
+                        className="me-2",
+                    ),
+                    dbc.InputGroup([
+                        dbc.InputGroupText(html.I(className="bi bi-search")),
+                        dbc.Input(id="input-search-rules", placeholder="Search configured rules...", type="text", size="sm"),
+                    ], style={"width": "220px"}),
+                ], className="d-flex align-items-center"),
+            ], className="dq-card-title"),
+
+            html.Div([
+                html.Table([
+                    html.Thead(html.Tr([
+                        html.Th("Rule Name"),
+                        html.Th("Column"),
+                        html.Th("Threshold"),
+                        html.Th("Severity"),
+                        html.Th("Status"),
+                        html.Th("Created At"),
+                        html.Th("Actions"),
+                    ])),
+                    html.Tbody(id="configured-rules-table-body", children=[]),
+                ], className="clean-table"),
+            ], style={"overflowX": "auto"}),
         ], className="dq-card mt-4"),
 
         # Preview SQL Modal
@@ -1030,7 +1780,7 @@ def page_rules():
                     ], className="mb-3"),
                     html.Div([
                         dbc.Label("Column", className="fw-semibold"),
-                        dbc.Input(id="edit-rule-column", type="text"),
+                        dbc.Select(id="edit-rule-column", options=[]),
                     ], className="mb-3"),
                     html.Div([
                         dbc.Label("Threshold", className="fw-semibold"),
@@ -1073,22 +1823,258 @@ def page_rules():
             ]),
         ], id="modal-delete-confirm", is_open=False),
 
+        # View Saved Rule SQL Modal
+        dbc.Modal([
+            dbc.ModalHeader(dbc.ModalTitle("Rule SQL Query")),
+            dbc.ModalBody([
+                html.Pre(id="view-rule-sql-code", style={"backgroundColor": "#0F172A", "color": "#38BDF8", "padding": "16px", "borderRadius": "8px", "fontSize": "0.85rem", "whiteSpace": "pre-wrap"}),
+            ]),
+            dbc.ModalFooter([
+                dbc.Button("Close", id="btn-close-rule-sql-modal", color="secondary"),
+            ]),
+        ], id="modal-view-rule-sql", is_open=False),
+
         # Hidden stores for tracking state
         dcc.Store(id="delete-rule-id", data=None),
-        dcc.Store(id="current-template-name", data=None),
+        dcc.Store(id="current-template-name", data="NULL_COUNT"),
         dcc.Store(id="rule-refresh-store", data=0),
     ])
 
+
 # -------------------------------------------------------------
-# PAGE 4: EXECUTION & MONITORING
+# PAGE 4: EXECUTION & MONITORING — helpers
 # -------------------------------------------------------------
+
+def _render_stepper(dq_status: str, rules_done: int, rules_total: int):
+    """Returns the stepper nodes for the pipeline card based on current status.
+
+    Stages:
+      IDLE     → all grey,  line hidden
+      RUNNING  → step1 done (green), step2 active (blue), line 33%
+      FINALIZING → steps 1-3 done, line 66%
+      COMPLETED/PASS/FAIL/ERROR → all done (green), line 100% full
+    """
+    if dq_status == "IDLE":
+        stages    = ["idle", "idle", "idle", "idle"]
+        line_cls  = "stepper-line-active stage-1"
+    elif dq_status == "RUNNING":
+        stages    = ["done", "active", "idle", "idle"]
+        line_cls  = "stepper-line-active stage-2"
+    elif dq_status == "FINALIZING":
+        stages    = ["done", "done", "active", "idle"]
+        line_cls  = "stepper-line-active stage-3"
+    elif dq_status in ("PASS", "FAIL", "ERROR", "COMPLETED"):
+        stages    = ["done", "done", "done", "done"]
+        line_cls  = "stepper-line-active stage-full"
+    else:
+        stages    = ["idle", "idle", "idle", "idle"]
+        line_cls  = "stepper-line-active stage-1"
+
+    running_label = "Running Rules"
+    if dq_status == "RUNNING" and rules_total > 0:
+        running_label = f"Running Rules ({rules_done}/{rules_total})"
+
+    def _circle(stage, icon_cls="bi bi-circle"):
+        if stage == "done":
+            return html.Div(html.I(className="bi bi-check-lg"), className="step-circle done")
+        elif stage == "active":
+            return html.Div(html.I(className="bi bi-arrow-repeat"), className="step-circle active")
+        return html.Div(html.I(className=icon_cls), className="step-circle")
+
+    def _label(text, stage):
+        cls = "step-label"
+        if stage == "active":
+            cls += " active"
+        elif stage == "done":
+            cls += " done"
+        return html.Div(text, className=cls)
+
+    return html.Div([
+        html.Div(className="stepper-line"),
+        html.Div(className=line_cls),
+        html.Div([_circle(stages[0]), _label("Initializing",   stages[0])], className="step-node"),
+        html.Div([_circle(stages[1]), _label(running_label,    stages[1])], className="step-node"),
+        html.Div([_circle(stages[2]), _label("Finalizing",     stages[2])], className="step-node"),
+        html.Div([_circle(stages[3]), _label("Completed",      stages[3])], className="step-node"),
+    ], className="stepper-container")
+
+
+def _render_rules_checklist(project_name: Optional[str], dataset_name: Optional[str]) -> List[Dict[str, Any]]:
+    """Builds checklist options for rules configured on the selected dataset."""
+    if not project_name or not dataset_name:
+        return []
+    p_df = db_adapter.query_df("SELECT project_id FROM dq_project_config WHERE project_name = ?", (project_name,))
+    if p_df.empty:
+        return []
+    p_id = int(p_df.iloc[0]["project_id"])
+    d_df = db_adapter.query_df("SELECT dataset_id FROM dq_table_config WHERE project_id = ? AND dataset_name = ?", (p_id, dataset_name))
+    if d_df.empty:
+        return []
+    d_id = int(d_df.iloc[0]["dataset_id"])
+
+    rules_df = db_adapter.query_df("""
+        SELECT rule_id, rule_name, category, severity, template_name, column_name, threshold
+        FROM dq_rules
+        WHERE project_id = ? AND dataset_id = ? AND active = 1
+        ORDER BY rule_id ASC
+    """, (p_id, d_id))
+
+    if rules_df.empty:
+        return []
+
+    options = []
+    for _, r in rules_df.iterrows():
+        r_id = int(r["rule_id"])
+        r_name = str(r["rule_name"])
+        col = str(r.get("column_name") or "—")
+        tmpl = str(r.get("template_name") or "")
+        label = html.Span([
+            html.B(r_name, className="me-2 text-dark"),
+            html.Span(f"[{tmpl}]", className="badge bg-light text-secondary border me-2 small"),
+            html.Span(f"Col: {col}", className="text-muted small"),
+        ])
+        options.append({"label": label, "value": r_id})
+    return options
+
+
+def _render_schedules_table(project_name=None, dataset_name=None, status=None):
+    """Builds the table rows for configured persistent schedules."""
+    try:
+        df = db_adapter.get_schedules(project_name=project_name, dataset_name=dataset_name, status=status)
+    except Exception as e:
+        logger.error(f"Error fetching schedules: {e}")
+        df = pd.DataFrame()
+
+    if df.empty:
+        return [html.Tr([html.Td("No schedules configured yet. Click 'Scheduled Trigger' above to create an automated recurring audit.",
+                                colSpan=8, className="text-center text-muted p-4")])]
+
+    rows = []
+    for _, r in df.iterrows():
+        sid = int(r["schedule_id"])
+        s_name = str(r["schedule_name"])
+        p_name = str(r["project_name"])
+        d_name = str(r["dataset_name"])
+        freq = str(r.get("frequency") or "DAILY").upper()
+        next_run = str(r.get("next_run_at") or "—")
+        last_run = str(r.get("last_run_at") or "—")
+        last_st = str(r.get("last_status") or "—")
+        st = str(r.get("status") or "ACTIVE").upper()
+
+        st_badge = html.Span("ACTIVE", className="badge bg-success text-white") if st == "ACTIVE" else html.Span("PAUSED", className="badge bg-warning text-dark")
+
+        freq_display = freq
+        if freq == "WEEKLY" and r.get("weekdays"):
+            freq_display = f"Weekly ({r['weekdays']}) @ {r.get('start_time', '08:00')} {r.get('timezone', 'UTC')}"
+        elif freq == "CUSTOM" and r.get("cron_expression"):
+            freq_display = f"Cron: {r['cron_expression']}"
+        else:
+            freq_display = f"{freq} @ {r.get('start_time', '08:00')} {r.get('timezone', 'UTC')}"
+
+        actions = html.Div([
+            dbc.Button([html.I(className="bi bi-play-fill me-1"), "Run Now"],
+                       id={"type": "btn-sched-run-now", "id": sid},
+                       color="primary", size="sm", className="py-0 px-2 me-1 small", style={"fontSize": "0.75rem"}),
+            dbc.Button([html.I(className="bi bi-pause-fill" if st == "ACTIVE" else "bi bi-play-fill")],
+                       id={"type": "btn-sched-toggle-status", "id": sid, "status": st},
+                       color="outline-secondary", size="sm", className="py-0 px-2 me-1",
+                       title="Pause Schedule" if st == "ACTIVE" else "Resume Schedule"),
+            dbc.Button([html.I(className="bi bi-trash")],
+                       id={"type": "btn-sched-delete", "id": sid},
+                       color="outline-danger", size="sm", className="py-0 px-2",
+                       title="Delete Schedule"),
+        ], className="d-flex align-items-center justify-content-center")
+
+        rows.append(html.Tr([
+            html.Td(html.B(s_name), className="small"),
+            html.Td(f"{p_name} / {d_name}", className="small"),
+            html.Td(freq_display, className="small text-muted"),
+            html.Td(next_run, className="small text-primary fw-semibold"),
+            html.Td(f"{last_run} ({last_st})" if last_run != "—" else "—", className="small text-muted"),
+            html.Td(st_badge),
+            html.Td(actions, className="text-center"),
+        ]))
+    return rows
+
+
+def _render_history_table(project_name=None, dataset_name=None, trigger_type=None, status_filter=None, search=None):
+    """Builds the execution history table rows from dq_execution_summary with rich filtering."""
+    try:
+        hist_df = db_adapter.get_execution_history(
+            project_name=project_name,
+            dataset_name=dataset_name,
+            trigger_type=trigger_type,
+            status_filter=status_filter,
+            search=search,
+            limit=50
+        )
+    except Exception as e:
+        logger.error(f"Error fetching execution history: {e}")
+        hist_df = pd.DataFrame()
+
+    if hist_df.empty:
+        return [html.Tr([html.Td("No executions matching filter criteria.", colSpan=10,
+                                  className="text-center text-muted p-4")])]
+    rows = []
+    for _, r in hist_df.iterrows():
+        exec_id = str(r.get("execution_id", "—"))
+        s = str(r.get("overall_status", "—")).upper()
+        if s == "PASS":
+            badge_cls = "badge-pass"
+        elif s == "FAIL":
+            badge_cls = "badge-fail"
+        elif s == "CANCELLED":
+            badge_cls = "badge bg-secondary text-white"
+        elif s == "RUNNING":
+            badge_cls = "badge bg-primary text-white"
+        else:
+            badge_cls = "badge-error"
+
+        score = r.get("dq_score", 0)
+        score_str = f"{score:.1f}%" if score is not None and not pd.isna(score) else "—"
+        trig = str(r.get("trigger_type") or "MANUAL").upper()
+        trig_badge = html.Span("Manual", className="badge bg-light text-dark border me-1") if trig == "MANUAL" else html.Span("Scheduled", className="badge bg-info text-white me-1")
+
+        passed_cnt = int(r.get("passed", 0)) if pd.notnull(r.get("passed")) else 0
+        failed_cnt = int(r.get("failed", 0)) if pd.notnull(r.get("failed")) else 0
+        total_cnt = int(r.get("total_rules", 0)) if pd.notnull(r.get("total_rules")) else 0
+        rules_str = f"{passed_cnt}/{total_cnt}" if total_cnt > 0 else "0"
+
+        actions = html.Div([
+            dbc.Button([html.I(className="bi bi-eye")], id={"type": "btn-exec-details", "id": exec_id},
+                       color="link", size="sm", className="p-1 me-1 text-primary", title="View Execution Details"),
+            dbc.Button([html.I(className="bi bi-arrow-clockwise")], id={"type": "btn-exec-retry", "id": exec_id},
+                       color="link", size="sm", className="p-1 me-1 text-warning", title="Retry Failed Rules",
+                       disabled=(s == "RUNNING")),
+            dbc.Button([html.I(className="bi bi-download")], id={"type": "btn-exec-csv", "id": exec_id},
+                       color="link", size="sm", className="p-1 text-secondary", title="Download Results CSV"),
+        ], className="d-flex align-items-center justify-content-center")
+
+        rows.append(html.Tr([
+            html.Td(exec_id, style={"fontWeight": "600", "fontSize": "0.78rem", "fontFamily": "monospace"}),
+            html.Td(str(r.get("project_name", "—")), className="small"),
+            html.Td(str(r.get("dataset_name", "—")), className="small"),
+            html.Td(trig_badge),
+            html.Td(html.Span(rules_str, className="small fw-semibold")),
+            html.Td(html.Span(s, className=badge_cls)),
+            html.Td(score_str, className="fw-bold small"),
+            html.Td(str(r.get("started_at", "—")), style={"fontSize": "0.78rem"}),
+            html.Td(str(r.get("duration", "—")), className="small"),
+            html.Td(actions, className="text-center"),
+        ]))
+    return rows
+
 
 def page_execution():
     projects = db_adapter.get_projects_list()["project_name"].tolist()
-    datasets = db_adapter.get_datasets_for_project("Hospital")
 
     return html.Div([
-        # Header Bar
+        # Polling Interval — mounted whenever on Execution page
+        dcc.Interval(id="exec-interval", interval=1500, n_intervals=0, disabled=True),
+        dcc.Download(id="exec-download-csv"),
+        dcc.Store(id="exec-selected-rules-store", data=[]),
+
+        # ── Header Bar ───────────────────────────────────────────────────────
         html.Div([
             html.H3([
                 html.I(className="bi bi-play-circle text-primary"),
@@ -1098,519 +2084,1088 @@ def page_execution():
                 dbc.Select(
                     id="exec-select-project",
                     options=[{"label": p, "value": p} for p in projects],
-                    value="Hospital",
-                    style={"width": "160px"},
+                    value=projects[0] if projects else None,
+                    style={"width": "180px"},
                     className="me-2",
                 ),
                 dbc.Select(
                     id="exec-select-dataset",
-                    options=[{"label": d, "value": d} for d in datasets],
-                    value="source_table",
-                    style={"width": "180px"},
+                    options=[],
+                    value=None,
+                    style={"width": "200px"},
                     className="me-3",
                 ),
+                # Execution Mode Selector (Manual vs Scheduled)
+                dbc.RadioItems(
+                    id="exec-mode-toggle",
+                    className="btn-group me-3",
+                    inputClassName="btn-check",
+                    labelClassName="btn btn-outline-primary btn-sm px-3",
+                    labelCheckedClassName="active",
+                    options=[
+                        {"label": html.Span([html.I(className="bi bi-play-circle me-1"), "Manual Trigger"]), "value": "MANUAL"},
+                        {"label": html.Span([html.I(className="bi bi-clock-history me-1"), "Scheduled Trigger"]), "value": "SCHEDULED"},
+                    ],
+                    value="MANUAL",
+                ),
+                # Primary Trigger button
                 dbc.Button([
-                    html.I(className="bi bi-play-fill"),
+                    html.I(className="bi bi-play-fill me-1"),
                     "Run Validation"
-                ], id="btn-trigger-validation", className="btn-primary-action"),
-            ], className="d-flex align-items-center"),
+                ], id="btn-trigger-validation", className="btn-primary-action me-2",
+                   disabled=False),
+                # Cancel Execution button
+                dbc.Button([
+                    html.I(className="bi bi-stop-circle me-1"),
+                    "Cancel"
+                ], id="btn-cancel-execution", color="danger", outline=True, size="sm",
+                   disabled=True, className="me-1"),
+            ], className="d-flex align-items-center flex-wrap gap-2"),
         ], className="page-header-bar"),
 
-        # Phase 7: Databricks Workflow Job Automation Status Banner
+        # ── Sub-header: Active rules summary + Concurrency badge ───────────────
+        html.Div([
+            dbc.Row([
+                dbc.Col([
+                    html.Div(id="exec-active-rules-summary", className="small text-muted ps-1 fw-semibold"),
+                ], md=7),
+                dbc.Col([
+                    html.Div([
+                        html.Span([
+                            html.I(className="bi bi-lightning-charge-fill text-warning me-1"),
+                            "Parallel Engine: 4 Concurrent Worker Threads"
+                        ], className="badge bg-dark text-white px-3 py-2 small shadow-sm"),
+                    ], className="text-md-end"),
+                ], md=5),
+            ], className="align-items-center mb-3"),
+        ]),
+
+        # ── Manual Trigger Options (Expandable Rule Checklist) ────────────────
+        html.Div(id="exec-manual-container", children=[
+            html.Div([
+                dbc.Row([
+                    dbc.Col([
+                        html.Div("Rule Selection Mode:", className="small fw-semibold text-muted mb-1"),
+                        dbc.RadioItems(
+                            id="exec-rules-mode",
+                            options=[
+                                {"label": "Run All Configured Rules", "value": "ALL"},
+                                {"label": "Select Individual Rules to Run", "value": "SELECTED"},
+                            ],
+                            value="ALL",
+                            inline=True,
+                            className="small",
+                        ),
+                    ], md=6),
+                    dbc.Col([
+                        html.Div(id="exec-rule-selection-tools", children=[
+                            dbc.Button("Select All", id="btn-rules-select-all", size="sm", color="light", className="border me-2 py-0 px-2 small"),
+                            dbc.Button("Deselect All", id="btn-rules-deselect-all", size="sm", color="light", className="border py-0 px-2 small"),
+                        ], className="text-md-end pt-2", style={"display": "none"}),
+                    ], md=6),
+                ], className="align-items-center"),
+                # Checklist container
+                html.Div(id="exec-rules-checklist-container", children=[
+                    html.Div([
+                        dbc.Checklist(
+                            id="exec-rules-checklist",
+                            options=[],
+                            value=[],
+                            className="small mt-2",
+                        ),
+                    ], style={"maxHeight": "160px", "overflowY": "auto", "border": "1px solid #E2E8F0", "borderRadius": "6px", "padding": "10px", "backgroundColor": "#F8FAFC"}),
+                ], className="mt-2", style={"display": "none"}),
+            ], className="p-3 mb-3 bg-white border rounded shadow-sm"),
+        ]),
+
+        # ── Scheduled Trigger Configuration Card ──────────────────────────────
+        html.Div(id="exec-schedule-container", style={"display": "none"}, children=[
+            html.Div([
+                html.Div([
+                    html.H5([html.I(className="bi bi-calendar-plus text-primary me-2"), "Configure Automated Persistent Schedule"], className="fw-bold mb-1"),
+                    html.Div("Creates an autonomous backend schedule managed by the DQ Scheduler Service daemon.", className="small text-muted mb-3"),
+                ]),
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label("Schedule Name *", className="small fw-semibold"),
+                        dbc.Input(id="sched-input-name", placeholder="e.g. Daily_Employee_Master_DQ", size="sm"),
+                    ], md=4, className="mb-2"),
+                    dbc.Col([
+                        dbc.Label("Frequency *", className="small fw-semibold"),
+                        dbc.Select(
+                            id="sched-select-frequency",
+                            options=[
+                                {"label": "Daily", "value": "DAILY"},
+                                {"label": "Hourly", "value": "HOURLY"},
+                                {"label": "Weekly", "value": "WEEKLY"},
+                                {"label": "Monthly", "value": "MONTHLY"},
+                                {"label": "Custom Cron Expression", "value": "CUSTOM"},
+                                {"label": "Once", "value": "ONCE"},
+                            ],
+                            value="DAILY",
+                            size="sm",
+                        ),
+                    ], md=4, className="mb-2"),
+                    dbc.Col([
+                        dbc.Label("Timezone *", className="small fw-semibold"),
+                        dbc.Select(
+                            id="sched-select-timezone",
+                            options=[
+                                {"label": "UTC (Coordinated Universal Time)", "value": "UTC"},
+                                {"label": "US/Eastern (EST/EDT)", "value": "US/Eastern"},
+                                {"label": "US/Pacific (PST/PDT)", "value": "US/Pacific"},
+                                {"label": "Europe/London (GMT/BST)", "value": "Europe/London"},
+                                {"label": "Asia/Kolkata (IST)", "value": "Asia/Kolkata"},
+                                {"label": "Asia/Singapore (SGT)", "value": "Asia/Singapore"},
+                            ],
+                            value="UTC",
+                            size="sm",
+                        ),
+                    ], md=4, className="mb-2"),
+                ]),
+                # Dynamic frequency inputs
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label("Start Date *", className="small fw-semibold"),
+                        dbc.Input(id="sched-input-start-date", type="date", size="sm", value=datetime.today().strftime("%Y-%m-%d")),
+                    ], md=3, className="mb-2"),
+                    dbc.Col([
+                        dbc.Label("Execution Time (HH:MM) *", className="small fw-semibold"),
+                        dbc.Input(id="sched-input-start-time", type="time", size="sm", value="08:00"),
+                    ], md=3, className="mb-2"),
+                    dbc.Col([
+                        dbc.Label("Repeat Interval", className="small fw-semibold"),
+                        dbc.Input(id="sched-input-interval", type="number", min=1, value=1, size="sm"),
+                    ], md=3, id="sched-col-interval", className="mb-2"),
+                    dbc.Col([
+                        dbc.Label("End Date (Optional)", className="small fw-semibold"),
+                        dbc.Input(id="sched-input-end-date", type="date", size="sm"),
+                    ], md=3, className="mb-2"),
+                ]),
+                # Weekly checkboxes (visible when WEEKLY selected)
+                html.Div(id="sched-row-weekdays", style={"display": "none"}, children=[
+                    dbc.Label("Run On Weekdays *", className="small fw-semibold"),
+                    dbc.Checklist(
+                        id="sched-input-weekdays",
+                        options=[
+                            {"label": "Mon", "value": "MON"},
+                            {"label": "Tue", "value": "TUE"},
+                            {"label": "Wed", "value": "WED"},
+                            {"label": "Thu", "value": "THU"},
+                            {"label": "Fri", "value": "FRI"},
+                            {"label": "Sat", "value": "SAT"},
+                            {"label": "Sun", "value": "SUN"},
+                        ],
+                        value=["MON", "TUE", "WED", "THU", "FRI"],
+                        inline=True,
+                        className="small mb-2",
+                    ),
+                ]),
+                # Custom Cron input (visible when CUSTOM selected)
+                html.Div(id="sched-row-cron", style={"display": "none"}, children=[
+                    dbc.Label("Custom 5-Part Cron Expression (Min Hour Day Month DOW) *", className="small fw-semibold"),
+                    dbc.Input(id="sched-input-cron", placeholder="0 8 * * 1-5", size="sm", className="mb-2"),
+                ]),
+                # Concurrency policy & Save action
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label("Overlap / Concurrency Policy", className="small fw-semibold"),
+                        dbc.Select(
+                            id="sched-select-concurrency",
+                            options=[
+                                {"label": "SKIP (Skip if an existing validation is still running)", "value": "SKIP"},
+                                {"label": "QUEUE (Wait in queue until previous run completes)", "value": "QUEUE"},
+                                {"label": "PARALLEL (Execute concurrently)", "value": "PARALLEL"},
+                            ],
+                            value="SKIP",
+                            size="sm",
+                        ),
+                    ], md=6, className="mb-2"),
+                    dbc.Col([
+                        html.Div([
+                            dbc.Button([html.I(className="bi bi-check2-circle me-1"), "Save & Activate Schedule"],
+                                       id="btn-save-schedule", color="primary", size="sm", className="me-2 px-3"),
+                            dbc.Button("Reset", id="btn-reset-schedule", color="light", size="sm", className="border"),
+                        ], className="pt-4 text-md-end"),
+                    ], md=6),
+                ]),
+                html.Div(id="sched-feedback-msg", className="mt-2 small"),
+            ], className="p-3 mb-3 bg-white border rounded shadow-sm"),
+        ]),
+
+        # ── Active Schedules Table ────────────────────────────────────────────
+        html.Div(id="sched-table-card", className="dq-card mb-4", children=[
+            html.Div([
+                dbc.Row([
+                    dbc.Col([
+                        html.Div([
+                            html.I(className="bi bi-calendar-check text-primary me-2"),
+                            html.Span("Active & Configured Schedules", className="fw-bold"),
+                        ], className="fs-6"),
+                    ], md=6),
+                    dbc.Col([
+                        html.Div([
+                            dbc.Select(
+                                id="sched-filter-status",
+                                options=[
+                                    {"label": "Status: All", "value": "All"},
+                                    {"label": "Active", "value": "ACTIVE"},
+                                    {"label": "Paused", "value": "PAUSED"},
+                                ],
+                                value="All",
+                                size="sm",
+                                style={"width": "140px"},
+                                className="me-2 d-inline-block",
+                            ),
+                            dbc.Button([html.I(className="bi bi-arrow-clockwise me-1"), "Refresh"],
+                                       id="btn-refresh-schedules", size="sm", color="light", className="border"),
+                        ], className="text-md-end"),
+                    ], md=6),
+                ], className="align-items-center mb-2"),
+            ]),
+            html.Div([
+                html.Table([
+                    html.Thead(html.Tr([
+                        html.Th("Schedule Name"),
+                        html.Th("Target (Project / Dataset)"),
+                        html.Th("Frequency & Recurrence"),
+                        html.Th("Next Run At"),
+                        html.Th("Last Run"),
+                        html.Th("Status"),
+                        html.Th("Actions", className="text-center"),
+                    ]), className="table-header"),
+                    html.Tbody(id="sched-table-body"),
+                ], className="dq-table w-100"),
+            ], style={"overflowX": "auto"}),
+        ]),
+
+        # ── Databricks Job Banner ─────────────────────────────────────────────
         html.Div([
             dbc.Row([
                 dbc.Col([
                     html.Div([
                         html.I(className="bi bi-cpu-fill text-primary me-2 fs-5"),
-                        html.Span(f"Databricks Workflow Job #{db_adapter.DQ_JOB_ID}", style={"fontWeight": "700", "fontSize": "0.95rem"}),
+                        html.Span(f"Databricks Workflow Job #{db_adapter.DQ_JOB_ID}",
+                                  style={"fontWeight": "700", "fontSize": "0.95rem"}),
                     ]),
-                    html.Div("Automated multi-task orchestrator with retry policy (2 retries, 60s backoff) & schedule trigger.", className="text-muted small"),
+                    html.Div("Automated multi-task orchestrator with retry policy (2 retries, 60s backoff) & persistent schedule trigger.",
+                             className="text-muted small"),
                 ], md=7),
                 dbc.Col([
                     html.Div([
                         html.Span("Trigger: ", className="text-muted small"),
                         html.Span("Scheduled & Manual", className="badge-pass me-2", style={"fontSize": "0.75rem"}),
                         html.Span("Schedule: ", className="text-muted small"),
-                        html.Span("Quartz Cron (Configurable)", className="badge-active", style={"fontSize": "0.75rem"}),
+                        html.Span("Persistent Background Daemon", className="badge-active", style={"fontSize": "0.75rem"}),
                     ], className="text-md-end pt-1"),
                 ], md=5),
             ], className="align-items-center"),
         ], className="p-3 mb-3 rounded bg-white border shadow-sm"),
 
-        # Pipeline Stepper Card matching Screen 4
+        # ── Pipeline Stepper Card ─────────────────────────────────────────────
         html.Div([
-            html.Div([
-                html.Div(className="stepper-line"),
-                html.Div(id="stepper-progress-line", className="stepper-line-active"),
-                
-                # Step 1: Initializing
-                html.Div([
-                    html.Div(html.I(className="bi bi-check-lg"), className="step-circle done"),
-                    html.Div("Initializing", className="step-label"),
-                ], className="step-node"),
-
-                # Step 2: Running Rules
-                html.Div([
-                    html.Div(html.I(className="bi bi-arrow-repeat"), className="step-circle active"),
-                    html.Div("Running Rules (3/6)", className="step-label active"),
-                ], className="step-node"),
-
-                # Step 3: Finalizing
-                html.Div([
-                    html.Div(html.I(className="bi bi-circle"), className="step-circle"),
-                    html.Div("Finalizing", className="step-label"),
-                ], className="step-node"),
-
-                # Step 4: Completed
-                html.Div([
-                    html.Div(html.I(className="bi bi-check"), className="step-circle"),
-                    html.Div("Completed", className="step-label"),
-                ], className="step-node"),
-            ], className="stepper-container"),
-
+            html.Div(id="exec-stepper-container", children=_render_stepper("IDLE", 0, 0)),
             # Meta strip
             dbc.Row([
                 dbc.Col([
                     html.Div("Execution ID", className="text-muted small"),
-                    html.Div(id="exec-meta-id", children="EXEC-20261101-001", style={"fontWeight": "600", "color": "#0F172A"}),
-                ], xs=4),
+                    html.Div(id="exec-meta-id", children="—",
+                             style={"fontWeight": "600", "color": "#0F172A", "fontFamily": "monospace"}),
+                ], xs=3),
                 dbc.Col([
                     html.Div("Start Time", className="text-muted small"),
-                    html.Div(id="exec-meta-start", children="01 Nov 2026, 10:30 AM", style={"fontWeight": "600", "color": "#0F172A"}),
-                ], xs=4),
+                    html.Div(id="exec-meta-start", children="—",
+                             style={"fontWeight": "600", "color": "#0F172A"}),
+                ], xs=3),
                 dbc.Col([
                     html.Div("Duration", className="text-muted small"),
-                    html.Div(id="exec-meta-duration", children="2m 15s", style={"fontWeight": "600", "color": "#0F172A"}),
-                ], xs=4),
+                    html.Div(id="exec-meta-duration", children="—",
+                             style={"fontWeight": "600", "color": "#0F172A"}),
+                ], xs=3),
+                dbc.Col([
+                    html.Div("Concurrency", className="text-muted small"),
+                    html.Div("4 Workers Parallel",
+                             style={"fontWeight": "600", "color": "#2563EB"}),
+                ], xs=3),
             ], className="text-center pt-3 border-top"),
         ], className="dq-card mb-4"),
 
-        # Bottom Section: Results Cards (Left) & Live Progress Checklist (Right)
+        # ── KPI Cards + DQ Score + Live Progress ─────────────────────────────
         dbc.Row([
-            # Left 3 Cards
-            dbc.Col([
-                dbc.Row([
-                    dbc.Col([
-                        html.Div([
-                            html.I(className="bi bi-check-circle-fill text-success fs-3 mb-2"),
-                            html.Div("PASS", className="small fw-semibold text-muted"),
-                            html.Div(id="exec-count-pass", children="4", className="fs-2 fw-bold text-success"),
-                        ], className="dq-card text-center", style={"backgroundColor": "#F0FDF4", "borderColor": "#DCFCE7"}),
-                    ], xs=4),
-                    dbc.Col([
-                        html.Div([
-                            html.I(className="bi bi-x-circle-fill text-danger fs-3 mb-2"),
-                            html.Div("FAIL", className="small fw-semibold text-muted"),
-                            html.Div(id="exec-count-fail", children="1", className="fs-2 fw-bold text-danger"),
-                        ], className="dq-card text-center", style={"backgroundColor": "#FEF2F2", "borderColor": "#FEE2E2"}),
-                    ], xs=4),
-                    dbc.Col([
-                        html.Div([
-                            html.I(className="bi bi-exclamation-triangle-fill text-warning fs-3 mb-2"),
-                            html.Div("ERROR", className="small fw-semibold text-muted"),
-                            html.Div(id="exec-count-error", children="1", className="fs-2 fw-bold text-warning"),
-                        ], className="dq-card text-center", style={"backgroundColor": "#FFFBEB", "borderColor": "#FEF3C7"}),
-                    ], xs=4),
-                ], className="g-2"),
-            ], lg=6, className="mb-4"),
-
-            # Right Live Progress Checklist
+            # PASS card
             dbc.Col([
                 html.Div([
-                    html.Div("Live Progress", className="dq-card-title"),
-                    html.Div(id="exec-live-progress-list", children=[
-                        html.Div([
-                            html.I(className="bi bi-check-circle-fill text-success me-2"),
-                            html.Span("NULL_COUNT - PASS", className="fw-semibold"),
-                        ], className="mb-2 p-2 rounded", style={"backgroundColor": "#F0FDF4"}),
-                        html.Div([
-                            html.I(className="bi bi-x-circle-fill text-danger me-2"),
-                            html.Span("AGE_NON_NEGATIVE - FAIL", className="fw-semibold"),
-                        ], className="mb-2 p-2 rounded", style={"backgroundColor": "#FEF2F2"}),
-                        html.Div([
-                            html.I(className="bi bi-check-circle-fill text-success me-2"),
-                            html.Span("DATA_FRESHNESS - PASS", className="fw-semibold"),
-                        ], className="mb-2 p-2 rounded", style={"backgroundColor": "#F0FDF4"}),
-                        html.Div([
-                            html.I(className="bi bi-exclamation-triangle-fill text-warning me-2"),
-                            html.Span("REQUIRED_COLUMNS - ERROR", className="fw-semibold"),
-                        ], className="p-2 rounded", style={"backgroundColor": "#FFFBEB"}),
-                    ]),
+                    html.I(className="bi bi-check-circle-fill text-success fs-3 mb-2"),
+                    html.Div("PASS", className="small fw-semibold text-muted"),
+                    html.Div(id="exec-count-pass", children="—",
+                             className="fs-2 fw-bold text-success"),
+                ], className="dq-card text-center h-100",
+                   style={"backgroundColor": "#F0FDF4", "borderColor": "#DCFCE7"}),
+            ], xs=6, md=3, className="mb-3"),
+
+            # FAIL card
+            dbc.Col([
+                html.Div([
+                    html.I(className="bi bi-x-circle-fill text-danger fs-3 mb-2"),
+                    html.Div("FAIL", className="small fw-semibold text-muted"),
+                    html.Div(id="exec-count-fail", children="—",
+                             className="fs-2 fw-bold text-danger"),
+                ], className="dq-card text-center h-100",
+                   style={"backgroundColor": "#FEF2F2", "borderColor": "#FEE2E2"}),
+            ], xs=6, md=3, className="mb-3"),
+
+            # ERROR card
+            dbc.Col([
+                html.Div([
+                    html.I(className="bi bi-exclamation-triangle-fill text-warning fs-3 mb-2"),
+                    html.Div("ERROR", className="small fw-semibold text-muted"),
+                    html.Div(id="exec-count-error", children="—",
+                             className="fs-2 fw-bold text-warning"),
+                ], className="dq-card text-center h-100",
+                   style={"backgroundColor": "#FFFBEB", "borderColor": "#FEF3C7"}),
+            ], xs=6, md=3, className="mb-3"),
+
+            # DQ Score card
+            dbc.Col([
+                html.Div([
+                    html.I(className="bi bi-graph-up-arrow text-primary fs-3 mb-2"),
+                    html.Div("DQ Score", className="small fw-semibold text-muted"),
+                    html.Div(id="exec-dq-score", children="—",
+                             className="fs-2 fw-bold text-primary"),
+                ], className="dq-card text-center h-100",
+                   style={"backgroundColor": "#EFF6FF", "borderColor": "#BFDBFE"}),
+            ], xs=6, md=3, className="mb-3"),
+        ], className="g-3 mb-2"),
+
+        # ── Live Progress Stream ──────────────────────────────────────────────
+        dbc.Row([
+            dbc.Col([
+                html.Div([
+                    html.Div([
+                        html.Span("Live Rule Execution Stream (Parallel Workers)", className="dq-card-title"),
+                        html.Span("Updates in real-time as each worker thread evaluates rules", className="small text-muted ms-2"),
+                    ], className="mb-2"),
+                    html.Div(id="exec-live-progress-list",
+                             children=[html.Div("Click Run Validation to start parallel execution.",
+                                                className="text-muted p-2")]),
                 ], className="dq-card"),
-            ], lg=6, className="mb-4"),
-        ], className="g-3"),
+            ], width=12),
+        ], className="g-3 mb-3"),
+
+        # ── Execution History Table ───────────────────────────────────────────
+        html.Div([
+            html.Div([
+                dbc.Row([
+                    dbc.Col([
+                        html.Div("Execution History & Audit Log", className="dq-card-title"),
+                    ], md=4),
+                    dbc.Col([
+                        html.Div([
+                            dbc.Select(
+                                id="exec-hist-filter-trigger",
+                                options=[
+                                    {"label": "Trigger: All", "value": "All"},
+                                    {"label": "Manual", "value": "MANUAL"},
+                                    {"label": "Scheduled", "value": "SCHEDULED"},
+                                ],
+                                value="All",
+                                size="sm",
+                                style={"width": "130px"},
+                                className="me-2 d-inline-block",
+                            ),
+                            dbc.Select(
+                                id="exec-hist-filter-status",
+                                options=[
+                                    {"label": "Status: All", "value": "All"},
+                                    {"label": "PASS", "value": "PASS"},
+                                    {"label": "FAIL", "value": "FAIL"},
+                                    {"label": "CANCELLED", "value": "CANCELLED"},
+                                ],
+                                value="All",
+                                size="sm",
+                                style={"width": "130px"},
+                                className="me-2 d-inline-block",
+                            ),
+                            dbc.Input(
+                                id="exec-hist-search",
+                                placeholder="Search ID, project...",
+                                size="sm",
+                                style={"width": "180px"},
+                                className="d-inline-block",
+                            ),
+                        ], className="text-md-end"),
+                    ], md=8),
+                ], className="align-items-center mb-3"),
+            ]),
+            html.Div([
+                html.Table([
+                    html.Thead(html.Tr([
+                        html.Th("Execution ID", style={"fontSize": "0.8rem"}),
+                        html.Th("Project"),
+                        html.Th("Dataset"),
+                        html.Th("Trigger"),
+                        html.Th("Rules (Pass/Total)"),
+                        html.Th("Status"),
+                        html.Th("DQ Score"),
+                        html.Th("Started At", style={"fontSize": "0.8rem"}),
+                        html.Th("Duration"),
+                        html.Th("Actions", className="text-center"),
+                    ]), className="table-header"),
+                    html.Tbody(id="exec-history-table-body"),
+                ], className="dq-table w-100"),
+            ], style={"overflowX": "auto"}),
+        ], className="dq-card mt-2"),
+
+        # ── Execution Details Drill-down Modal ────────────────────────────────
+        dbc.Modal([
+            dbc.ModalHeader(dbc.ModalTitle(id="exec-details-modal-title", children="Execution Details"), close_button=True),
+            dbc.ModalBody(id="exec-details-modal-body", children=[html.Div("Loading details...")]),
+            dbc.ModalFooter([
+                dbc.Button([html.I(className="bi bi-download me-1"), "Download Results CSV"], id="btn-modal-download-csv", color="primary", size="sm"),
+                dbc.Button("Close", id="btn-close-details-modal", color="secondary", size="sm"),
+            ]),
+        ], id="exec-details-modal", size="xl", is_open=False),
+
+        # Quick Actions Strip
+        html.Div([
+            html.Span("Quick Actions: ", className="fw-semibold me-2 small text-muted"),
+            dbc.Button([html.I(className="bi bi-check2-square me-1"), "View DQ Results"], href="/results", color="primary", size="sm", outline=True, className="me-2"),
+            dbc.Button([html.I(className="bi bi-arrow-left-right me-1"), "Run Reconciliation"], href="/reconciliation", color="secondary", size="sm", outline=True, className="me-2"),
+            dbc.Button([html.I(className="bi bi-bell me-1"), "View Alerts & Reports"], href="/alerts", color="info", size="sm", outline=True, className="me-2"),
+        ], className="mt-3 p-3 bg-white border rounded d-flex align-items-center"),
     ])
 
 # -------------------------------------------------------------
 # PAGE 5: DATA QUALITY RESULTS
 # -------------------------------------------------------------
 
-def page_results():
-    projects = db_adapter.get_projects_list()["project_name"].tolist()
-    datasets = db_adapter.get_datasets_for_project("Hospital")
-    results_df = db_adapter.get_dq_results_table()
-
-    table_rows = []
-    for _, r in results_df.iterrows():
+def _results_rows(df):
+    """Table rows for the DQ Results page."""
+    rows = []
+    for _, r in df.iterrows():
         s = str(r["status"])
         badge_cls = "badge-pass" if s == "PASS" else ("badge-fail" if s == "FAIL" else "badge-error")
-        table_rows.append(html.Tr([
+        sev = str(r.get("severity") or "High")
+        rows.append(html.Tr([
+            html.Td(str(r["execution_id"]), style={"fontSize": "0.75rem", "fontWeight": "600"}),
+            html.Td(str(r["project_name"])),
+            html.Td(str(r["dataset_name"])),
             html.Td(r["rule_name"], style={"fontWeight": "600"}),
-            html.Td(r["category"]),
+            html.Td(str(r["category"])),
+            html.Td(sev),
             html.Td(html.Span(s, className=badge_cls)),
+            html.Td(str(r["observed_value"] if r["observed_value"] is not None else "-")),
+            html.Td(str(r["expected_value"] if r["expected_value"] is not None else "-")),
             html.Td(str(r["failure_count"])),
-            html.Td(str(r["observed_value"] or "-")),
-            html.Td(str(r["expected_value"] or "-")),
-            html.Td(str(r["executed_at"])),
+            html.Td(str(r["error_message"] or "—"), style={"fontSize": "0.75rem", "maxWidth": "220px"}),
+            html.Td(f"{int(r['duration_ms'] or 0)} ms"),
+            html.Td(str(r["executed_at"]), style={"fontSize": "0.78rem"}),
+            html.Td(dbc.Button("Inspect", id={"type": "btn-inspect-result", "id": int(r["result_id"])},
+                               size="sm", color="light",
+                               style={"fontSize": "0.75rem", "fontWeight": "600", "color": "#2563EB"})),
         ]))
+    return rows or [html.Tr([html.Td("No results match the selected filters.", colSpan=14,
+                                     className="text-center text-muted")])]
+
+
+def page_results():
+    projects = db_adapter.get_projects_list()["project_name"].tolist()
+    categories = sorted({v["category"] for v in RULE_TEMPLATES.values()})
+
+    def _sel(id_, opts, width):
+        return dbc.Select(id=id_, options=opts, value="All", style={"width": width}, size="sm", className="me-2 mb-2")
 
     return html.Div([
-        # Header Bar with Filters & Export Button
         html.Div([
-            html.H3([
-                html.I(className="bi bi-check2-square text-primary"),
-                "DQ Results"
-            ], className="page-main-title"),
-            html.Div([
-                dbc.Select(
-                    id="filter-results-project",
-                    options=[{"label": p, "value": p} for p in projects],
-                    value="Hospital",
-                    style={"width": "140px"},
-                    className="me-2",
-                ),
-                dbc.Select(
-                    id="filter-results-dataset",
-                    options=[{"label": d, "value": d} for d in datasets],
-                    value="source_table",
-                    style={"width": "160px"},
-                    className="me-2",
-                ),
-                dbc.Select(
-                    id="filter-results-status",
-                    options=[
-                        {"label": "Status: All", "value": "All"},
-                        {"label": "PASS", "value": "PASS"},
-                        {"label": "FAIL", "value": "FAIL"},
-                        {"label": "ERROR", "value": "ERROR"},
-                    ],
-                    value="All",
-                    style={"width": "130px"},
-                    className="me-2",
-                ),
-                dbc.Select(
-                    id="filter-results-days",
-                    options=[
-                        {"label": "Last 7 Days", "value": "7"},
-                        {"label": "Last 30 Days", "value": "30"},
-                    ],
-                    value="7",
-                    style={"width": "140px"},
-                    className="me-3",
-                ),
-                dbc.Button([
-                    html.I(className="bi bi-download"),
-                    "Export CSV"
-                ], id="btn-export-results-csv", className="btn-primary-action"),
-            ], className="d-flex align-items-center"),
+            html.H3([html.I(className="bi bi-check2-square text-primary"), "DQ Results"], className="page-main-title"),
+            dbc.Button([html.I(className="bi bi-download"), "Export CSV"],
+                       id="btn-export-results-csv", className="btn-primary-action"),
         ], className="page-header-bar"),
 
-        # Results Table Card
         html.Div([
-            html.Table([
-                html.Thead(html.Tr([
-                    html.Th("Rule Name"),
-                    html.Th("Category"),
-                    html.Th("Status"),
-                    html.Th("Failure Count"),
-                    html.Th("Observed Value"),
-                    html.Th("Expected Value"),
-                    html.Th("Executed At"),
-                ])),
-                html.Tbody(id="results-table-body", children=table_rows),
-            ], className="clean-table"),
+            _sel("filter-results-project", [{"label": "Project: All", "value": "All"}] + [{"label": p, "value": p} for p in projects], "160px"),
+            _sel("filter-results-dataset", [{"label": "Dataset: All", "value": "All"}], "170px"),
+            _sel("filter-results-category", [{"label": "Category: All", "value": "All"}] + [{"label": c, "value": c} for c in categories], "160px"),
+            _sel("filter-results-severity", [{"label": "Severity: All", "value": "All"}] + [{"label": s, "value": s} for s in ("Critical", "High", "Medium", "Low")], "140px"),
+            _sel("filter-results-status", [{"label": "Status: All", "value": "All"}] + [{"label": s, "value": s} for s in ("PASS", "FAIL", "ERROR")], "130px"),
+            dbc.Input(id="filter-results-exec", placeholder="Execution ID...", size="sm", style={"width": "170px"}, className="me-2 mb-2", debounce=True),
+            dbc.Input(id="filter-results-rule", placeholder="Search rule...", size="sm", style={"width": "160px"}, className="mb-2", debounce=True),
+        ], className="d-flex flex-wrap align-items-center mb-2"),
+
+        html.Div([
+            html.Div(id="results-count-label", className="small text-muted mb-2"),
+            html.Div(html.Table([
+                html.Thead(html.Tr([html.Th(h) for h in (
+                    "Execution ID", "Project", "Dataset", "Rule Name", "Category", "Severity", "Status",
+                    "Observed", "Expected", "Failures", "Error Message", "Duration", "Executed At", "")])),
+                html.Tbody(id="results-table-body"),
+            ], className="clean-table"), style={"overflowX": "auto"}),
         ], className="dq-card mb-4"),
+
+        dbc.Modal([
+            dbc.ModalHeader(dbc.ModalTitle(id="result-detail-title", children="Result Detail")),
+            dbc.ModalBody(id="result-detail-body"),
+            dbc.ModalFooter(dbc.Button("Close", id="btn-close-result-detail", color="secondary")),
+        ], id="modal-result-detail", is_open=False, size="xl"),
     ])
 
 # -------------------------------------------------------------
 # PAGE 6: SOURCE-TO-TARGET RECONCILIATION
 # -------------------------------------------------------------
 
-def page_reconciliation():
-    recon = db_adapter.get_reconciliation_data()
+RECON_CHECKS = ["ROW_COUNT", "MISSING_IN_TARGET", "MISSING_IN_SOURCE",
+                "DUPLICATE_BUSINESS_KEY", "COLUMN_COMPARE", "NULL_COMPARE"]
 
-    # 4 Top KPI Cards matching Screen 6
-    kpi_cards = [
+
+def _recon_content(recon):
+    """Builds the dynamic body of the Reconciliation page from get_reconciliation_data()."""
+    is_pass = recon["status"] == "PASS"
+    kpis = [
         ("Source Count", recon["source_count"], "#EFF6FF", "#1E293B"),
         ("Target Count", recon["target_count"], "#EFF6FF", "#1E293B"),
         ("Difference", recon["difference"], "#EFF6FF", "#1E293B"),
-        ("Status", recon["status"], "#FEE2E2", "#DC2626"),
+        ("Status", recon["status"], "#DCFCE7" if is_pass else "#FEE2E2", "#15803D" if is_pass else "#DC2626"),
     ]
+    kpi_cols = [dbc.Col(html.Div([
+        html.Div(t, className="small text-muted fw-semibold mb-1"),
+        html.Div(v, style={"fontSize": "1.6rem", "fontWeight": "700", "color": fg}),
+    ], className="dq-card text-center", style={"backgroundColor": bg}), xs=6, md=3, className="mb-3")
+        for t, v, bg, fg in kpis]
 
-    cols = [
-        dbc.Col(
-            html.Div([
-                html.Div(title, className="small text-muted fw-semibold mb-1"),
-                html.Div(val, style={"fontSize": "1.75rem", "fontWeight": "700", "color": fg}),
-            ], className="dq-card text-center", style={"backgroundColor": bg}),
-            xs=6, md=3, className="mb-3",
-        )
-        for title, val, bg, fg in kpi_cards
-    ]
+    check_rows = [html.Tr([
+        html.Td(c["check_name"], style={"fontWeight": "600"}),
+        html.Td(f"{int(c.get('source_count', 0)):,}"),
+        html.Td(f"{int(c.get('target_count', 0)):,}"),
+        html.Td(f"{int(c.get('mismatch_count', 0)):,}"),
+        html.Td(html.Span(c["status"], className="badge-pass" if c["status"] == "PASS" else "badge-fail")),
+        html.Td(c.get("details", ""), style={"fontSize": "0.8rem"}),
+    ]) for c in recon["checks"]] or [html.Tr([html.Td("No checks recorded yet. Click Run Reconciliation.", colSpan=6, className="text-center text-muted")])]
 
-    # Sample missing rows
-    samples_df = recon["samples"]
-    sample_rows = []
-    for _, row in samples_df.iterrows():
-        sample_rows.append(html.Tr([
-            html.Td(str(row["patient_id"])),
-            html.Td(str(row["patient_name"])),
-        ]))
+    samples = recon.get("samples", pd.DataFrame())
+    if isinstance(samples, pd.DataFrame) and not samples.empty:
+        sample_rows = [html.Tr([
+            html.Td(str(r.get("key_id", r.get("key", r.get("patient_id", "—"))))),
+            html.Td(str(r.get("record_value", r.get("source_val", r.get("patient_name", "—"))))),
+            html.Td(str(r.get("reason", "—"))),
+        ]) for _, r in samples.iterrows()]
+    else:
+        sample_rows = [html.Tr([html.Td("No mismatched records.", colSpan=3, className="text-center text-muted")])]
+
+    hist = recon.get("history", pd.DataFrame())
+    if isinstance(hist, pd.DataFrame) and not hist.empty:
+        hist_rows = [html.Tr([
+            html.Td(str(h.get("execution_id", "—")), style={"fontSize": "0.78rem", "fontWeight": "600"}),
+            html.Td(str(h.get("dataset_name", "—"))),
+            html.Td(f"{int(h.get('source_count') or 0):,}"),
+            html.Td(f"{int(h.get('target_count') or 0):,}"),
+            html.Td(str(h.get("missing_in_target", 0))),
+            html.Td(str(h.get("extra_in_target", 0))),
+            html.Td(str(h.get("duplicate_keys", 0))),
+            html.Td(str(h.get("column_mismatches", 0))),
+            html.Td(html.Span(str(h.get("status", "PASS")), className="badge-pass" if h.get("status") == "PASS" else "badge-fail")),
+            html.Td(str(h.get("executed_at", "—")), style={"fontSize": "0.78rem"}),
+        ]) for _, h in hist.iterrows()]
+    else:
+        hist_rows = [html.Tr([html.Td("No reconciliation history.", colSpan=10, className="text-center text-muted")])]
 
     return html.Div([
-        # Header Bar
         html.Div([
-            html.H3([
-                html.I(className="bi bi-arrow-left-right text-primary"),
-                "Source-to-Target Reconciliation"
-            ], className="page-main-title"),
-        ], className="page-header-bar"),
-
-        # Top 4 KPI Cards
-        dbc.Row(cols, className="g-3 mb-4"),
-
-        # Bottom 2 Columns: Validation Summary & Missing Records Sample
+            html.Span([html.B("Source: "), html.Code(recon.get("source_table", "—"))], className="me-4"),
+            html.Span([html.B("Target: "), html.Code(recon.get("target_table", "—"))], className="me-4"),
+            html.Span([html.B("Business Key: "), html.Code(recon.get("business_key", "—"))], className="me-4"),
+            html.Span([html.B("Last Run: "), f"{recon.get('execution_id', '—')} at {recon.get('executed_at', '—')}"], className="text-muted small"),
+        ], className="p-3 mb-3 rounded bg-white border small"),
+        dbc.Row(kpi_cols, className="g-3 mb-2"),
         dbc.Row([
-            # Validation Summary
-            dbc.Col([
-                html.Div([
-                    html.Div("Validation Summary", className="dq-card-title"),
-                    html.Div([
-                        html.Div([
-                            html.I(className="bi bi-check-circle-fill text-success me-2"),
-                            html.Span("Matching Records", className="fw-semibold"),
-                            html.Span(recon["matching"], className="float-end fw-bold"),
-                        ], className="p-3 mb-2 rounded bg-light"),
-                        html.Div([
-                            html.I(className="bi bi-x-circle-fill text-danger me-2"),
-                            html.Span("Missing in Target", className="fw-semibold"),
-                            html.Span(recon["missing"], className="float-end fw-bold text-danger"),
-                        ], className="p-3 mb-2 rounded bg-light"),
-                        html.Div([
-                            html.I(className="bi bi-check-circle-fill text-success me-2"),
-                            html.Span("Extra in Target", className="fw-semibold"),
-                            html.Span(recon["extra"], className="float-end fw-bold"),
-                        ], className="p-3 mb-2 rounded bg-light"),
-                        html.Div([
-                            html.I(className="bi bi-check-circle-fill text-success me-2"),
-                            html.Span("Duplicate Keys", className="fw-semibold"),
-                            html.Span(recon["duplicate"], className="float-end fw-bold"),
-                        ], className="p-3 rounded bg-light"),
-                    ]),
-                ], className="dq-card"),
-            ], lg=6, className="mb-4"),
-
-            # Missing Records (Sample)
-            dbc.Col([
-                html.Div([
-                    html.Div([
-                        html.Span("Missing Records (Sample)"),
-                        html.A("View All ->", href="#", id="btn-view-all-missing", style={"fontSize": "0.85rem", "fontWeight": "600", "color": "#2563EB", "textDecoration": "none"}),
-                    ], className="dq-card-title"),
-                    html.Table([
-                        html.Thead(html.Tr([
-                            html.Th("patient_id"),
-                            html.Th("patient_name"),
-                        ])),
-                        html.Tbody(sample_rows),
-                    ], className="clean-table"),
-                ], className="dq-card"),
-            ], lg=6, className="mb-4"),
+            dbc.Col(html.Div([
+                html.Div("Validation Summary", className="dq-card-title"),
+                *[html.Div([html.Span(lbl, className="fw-semibold"), html.Span(val, className="float-end fw-bold")],
+                           className="p-2 mb-2 rounded bg-light")
+                  for lbl, val in (("Matching Records", recon.get("matching", "0")), ("Missing in Target", recon.get("missing", "0")),
+                                   ("Missing in Source (Extra in Target)", recon.get("extra", "0")), ("Duplicate Keys", recon.get("duplicate", "0")),
+                                   ("Column Mismatches", recon.get("col_mismatches", "0")), ("NULL Mismatches", recon.get("null_mismatches", "0")))],
+            ], className="dq-card"), lg=4, className="mb-4"),
+            dbc.Col(html.Div([
+                html.Div("Check Breakdown", className="dq-card-title"),
+                html.Table([html.Thead(html.Tr([html.Th(h) for h in ("Check", "Source", "Target", "Mismatches", "Status", "Details")])),
+                            html.Tbody(check_rows)], className="clean-table"),
+            ], className="dq-card"), lg=8, className="mb-4"),
         ], className="g-3"),
+        dbc.Row([
+            dbc.Col(html.Div([
+                html.Div("Mismatched Records (Sample)", className="dq-card-title"),
+                html.Table([html.Thead(html.Tr([html.Th("Business Key"), html.Th("Value"), html.Th("Reason")])),
+                            html.Tbody(sample_rows)], className="clean-table"),
+            ], className="dq-card"), lg=5, className="mb-4"),
+            dbc.Col(html.Div([
+                html.Div("Reconciliation History", className="dq-card-title"),
+                html.Div(html.Table([html.Thead(html.Tr([html.Th(h) for h in (
+                    "Execution ID", "Dataset", "Source", "Target", "Missing", "Extra", "Dup Keys", "Col Diff", "Status", "Executed At")])),
+                    html.Tbody(hist_rows)], className="clean-table"), style={"overflowX": "auto"}),
+            ], className="dq-card"), lg=7, className="mb-4"),
+        ], className="g-3"),
+    ])
+
+
+def page_reconciliation():
+    projects = db_adapter.get_projects_list()["project_name"].tolist()
+    first_proj = projects[0] if projects else None
+    datasets = db_adapter.get_datasets_for_project(first_proj, include_inactive=True) if first_proj else []
+    return html.Div([
+        html.Div([
+            html.H3([html.I(className="bi bi-arrow-left-right text-primary"), "Source-to-Target Reconciliation"],
+                    className="page-main-title"),
+            html.Div([
+                dbc.Select(id="recon-select-project", options=[{"label": p, "value": p} for p in projects],
+                           value=first_proj, style={"width": "170px"}, className="me-2"),
+                dbc.Select(id="recon-select-dataset", options=[{"label": d, "value": d} for d in datasets],
+                           value=datasets[0] if datasets else None, style={"width": "190px"}, className="me-2"),
+                dbc.Button([html.I(className="bi bi-play-fill me-1"), "Run Reconciliation"],
+                           id="btn-run-recon", className="btn-primary-action me-2"),
+                dbc.Button([html.I(className="bi bi-download me-1"), "Export CSV"],
+                           id="btn-export-recon", color="secondary", outline=True),
+            ], className="d-flex align-items-center"),
+        ], className="page-header-bar"),
+        html.Div([
+            html.Span("Checks: ", className="fw-semibold small me-2"),
+            dbc.Checklist(id="recon-checks", options=[{"label": c, "value": c} for c in RECON_CHECKS],
+                          value=RECON_CHECKS, inline=True, className="small"),
+        ], className="d-flex align-items-center mb-3"),
+        html.Div(id="recon-run-alert"),
+        dcc.Loading(html.Div(id="recon-content")),
     ])
 
 # -------------------------------------------------------------
 # PAGE 7: ALERTS & REPORTS (PHASE 6 ENHANCED)
 # -------------------------------------------------------------
 
-def page_alerts():
-    alerts_data = db_adapter.get_alerts_data()
-    alerts_df = alerts_data["alerts_table"]
+REPORT_TYPES = [
+    ("Project-wise Summary Report", "PROJECT_WISE"),
+    ("Dataset-wise Definitions & Health", "DATASET_WISE"),
+    ("Rule-wise Detailed Results", "RULE_WISE"),
+    ("Failed Rules Report", "FAILED_RULES"),
+    ("Critical Failures Report", "CRITICAL_FAILURES"),
+    ("Reconciliation Report", "RECONCILIATION"),
+    ("Execution-wise Run History", "EXECUTION_WISE"),
+    ("DQ Trend Report", "DQ_TREND"),
+]
 
-    # Top KPI cards
+
+def _alerts_kpis_and_chart(alerts_data):
     kpi_cards = [
         ("Critical Alerts", alerts_data["critical_count"], "bi bi-exclamation-triangle-fill", "#FEE2E2", "#DC2626"),
         ("High Alerts", alerts_data["high_count"], "bi bi-exclamation-circle-fill", "#FFEDD5", "#EA580C"),
         ("Active Alerts", alerts_data["active_count"], "bi bi-bell-fill", "#EFF6FF", "#2563EB"),
         ("Total Alerts", alerts_data["total_count"], "bi bi-shield-check", "#F1F5F9", "#475569"),
     ]
+    kpi_row = dbc.Row([dbc.Col(html.Div([
+        html.Div([html.Div(t, className="metric-title"), html.Div(str(v), className="metric-val")]),
+        html.Div(html.I(className=icon, style={"color": fg}), className="metric-icon-box", style={"backgroundColor": bg}),
+    ], className="metric-pill-card"), xs=12, sm=6, md=3, className="mb-3") for t, v, icon, bg, fg in kpi_cards], className="g-3 mb-2")
 
-    kpi_cols = [
-        dbc.Col(
-            html.Div([
-                html.Div([
-                    html.Div(title, className="metric-title"),
-                    html.Div(str(val), className="metric-val"),
-                ]),
-                html.Div(
-                    html.I(className=icon, style={"color": fg}),
-                    className="metric-icon-box",
-                    style={"backgroundColor": bg},
-                ),
-            ], className="metric-pill-card"),
-            xs=12, sm=6, md=3, className="mb-3",
-        )
-        for title, val, icon, bg, fg in kpi_cards
-    ]
-
-    # Alerts by Severity Bar Chart
     sev_counts = [alerts_data["critical_count"], alerts_data["high_count"], alerts_data["medium_count"], alerts_data["low_count"]]
-    sev_labels = ["Critical", "High", "Medium", "Low"]
-    fig_bar = go.Figure(data=[go.Bar(
-        x=sev_labels,
-        y=sev_counts,
-        text=sev_counts,
-        textposition="outside",
-        marker_color=["#EF4444", "#F97316", "#F59E0B", "#10B981"],
-    )])
-    fig_bar.update_layout(
-        margin=dict(l=10, r=10, t=25, b=25),
-        height=160,
-        plot_bgcolor="#FFFFFF",
-        paper_bgcolor="#FFFFFF",
-        yaxis=dict(visible=False, range=[0, max(sev_counts + [3]) + 1]),
-        xaxis=dict(tickfont=dict(size=12, color="#475569")),
-    )
+    fig_bar = go.Figure(data=[go.Bar(x=["Critical", "High", "Medium", "Low"], y=sev_counts, text=sev_counts,
+                                     textposition="outside", marker_color=["#EF4444", "#F97316", "#F59E0B", "#10B981"])])
+    fig_bar.update_layout(margin=dict(l=10, r=10, t=25, b=25), height=170, plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
+                          yaxis=dict(visible=False, range=[0, max(sev_counts + [3]) * 1.25 + 1]),
+                          xaxis=dict(tickfont=dict(size=12, color="#475569")))
+    return kpi_row, fig_bar
 
-    # Alerts table rows
-    alert_rows = []
-    for _, a in alerts_df.iterrows():
+
+def _alert_rows(df):
+    rows = []
+    for _, a in df.iterrows():
         a_id = int(a["alert_id"])
         sev = str(a["severity"])
         st = str(a["status"])
+        notif_st = str(a.get("notification_status") or "PENDING").upper()
+        fail_reason = str(a.get("failure_reason") or "")
         
         sev_color = "#EF4444" if sev == "Critical" else ("#F97316" if sev == "High" else ("#F59E0B" if sev == "Medium" else "#10B981"))
         badge_style = {"backgroundColor": sev_color + "22", "color": sev_color, "fontWeight": "600", "padding": "4px 8px", "borderRadius": "12px", "fontSize": "0.75rem"}
-        
+        btn_style = {"fontSize": "0.75rem", "padding": "2px 8px"}
+
+        if notif_st in ("SENT", "DELIVERED"):
+            notif_badge = html.Span([
+                html.I(className="bi bi-envelope-check-fill me-1"),
+                "SENT"
+            ], className="badge", style={"backgroundColor": "#DCFCE7", "color": "#15803D", "fontSize": "0.75rem", "fontWeight": "600", "borderRadius": "12px", "padding": "4px 8px"})
+        elif notif_st == "FAILED":
+            notif_badge = html.Div([
+                html.Span([
+                    html.I(className="bi bi-envelope-x-fill me-1"),
+                    "FAILED"
+                ], className="badge me-1", style={"backgroundColor": "#FEE2E2", "color": "#DC2626", "fontSize": "0.75rem", "fontWeight": "600", "borderRadius": "12px", "padding": "4px 8px"}),
+                dbc.Button(
+                    html.I(className="bi bi-info-circle-fill"),
+                    id={"type": "btn-view-notif-err", "id": a_id},
+                    size="sm",
+                    color="link",
+                    className="p-0 text-danger",
+                    title="Click to view failure details & root cause error",
+                    style={"fontSize": "0.9rem", "textDecoration": "none", "verticalAlign": "middle"}
+                ),
+            ], className="d-flex align-items-center")
+        elif notif_st == "RETRYING":
+            notif_badge = html.Span([
+                html.I(className="bi bi-arrow-repeat me-1"),
+                "RETRYING"
+            ], className="badge", style={"backgroundColor": "#FEF3C7", "color": "#B45309", "fontSize": "0.75rem", "fontWeight": "600", "borderRadius": "12px", "padding": "4px 8px"})
+        elif notif_st == "DISABLED":
+            notif_badge = html.Span([
+                html.I(className="bi bi-envelope-slash me-1"),
+                "DISABLED"
+            ], className="badge", style={"backgroundColor": "#F1F5F9", "color": "#64748B", "fontSize": "0.75rem", "fontWeight": "600", "borderRadius": "12px", "padding": "4px 8px"})
+        else:
+            notif_badge = html.Span([
+                html.I(className="bi bi-clock-history me-1"),
+                "PENDING"
+            ], className="badge", style={"backgroundColor": "#EFF6FF", "color": "#2563EB", "fontSize": "0.75rem", "fontWeight": "600", "borderRadius": "12px", "padding": "4px 8px"})
+
         actions = []
+        if notif_st in ("FAILED", "RETRYING"):
+            actions.append(dbc.Button([html.I(className="bi bi-arrow-repeat me-1"), "Retry Email"],
+                                      id={"type": "btn-retry-notif", "id": a_id},
+                                      size="sm", color="warning", outline=True, style=btn_style, className="me-1",
+                                      title="Retry sending failure notification email"))
+
         if st == "Active":
-            actions.append(dbc.Button("Acknowledge", id={"type": "btn-ack-alert", "id": a_id}, size="sm", color="primary", outline=True, style={"fontSize": "0.75rem", "padding": "2px 8px"}, className="me-1"))
-            actions.append(dbc.Button("Close", id={"type": "btn-close-alert", "id": a_id}, size="sm", color="danger", outline=True, style={"fontSize": "0.75rem", "padding": "2px 8px"}))
+            actions.append(dbc.Button("Acknowledge", id={"type": "btn-ack-alert", "id": a_id}, size="sm", color="primary", outline=True, style=btn_style, className="me-1"))
+            actions.append(dbc.Button("Close", id={"type": "btn-close-alert", "id": a_id}, size="sm", color="danger", outline=True, style=btn_style))
         elif st == "Acknowledged":
-            actions.append(dbc.Button("Close", id={"type": "btn-close-alert", "id": a_id}, size="sm", color="danger", outline=True, style={"fontSize": "0.75rem", "padding": "2px 8px"}, className="me-1"))
+            actions.append(dbc.Button("Close", id={"type": "btn-close-alert", "id": a_id}, size="sm", color="danger", outline=True, style=btn_style, className="me-1"))
             actions.append(html.Span(f"Ack by {a.get('acknowledged_by') or 'admin'}", className="text-muted small"))
         else:
             actions.append(html.Span(f"Closed by {a.get('closed_by') or 'admin'}", className="text-muted small"))
 
-        alert_rows.append(html.Tr([
-            html.Td(a["date_time"]),
+        rows.append(html.Tr([
+            html.Td(a["date_time"], style={"fontSize": "0.8rem"}),
+            html.Td(str(a["execution_id"]), style={"fontSize": "0.75rem"}),
             html.Td(a["project_name"], style={"fontWeight": "500"}),
+            html.Td(a["dataset_name"]),
             html.Td(a["rule_name"]),
             html.Td(html.Span(sev, style=badge_style)),
             html.Td(str(a.get("failure_count", 0))),
+            html.Td(notif_badge),
             html.Td(html.Span(st, className="badge-pass" if st == "Closed" else ("badge-fail" if st == "Active" else "badge-error"))),
             html.Td(actions),
         ]))
+    return rows or [html.Tr([html.Td("No alerts match the selected filters.", colSpan=10, className="text-center text-muted")])]
+
+
+def _render_notif_detail_modal_body(alert_id: int):
+    det = db_adapter.get_alert_notification_details(alert_id)
+    if not det:
+        return html.Div("Alert details could not be found.", className="text-muted p-3")
+
+    alert = det.get("alert", {})
+    proj = det.get("project", {})
+    logs = det.get("email_logs", [])
+    cfg = det.get("smtp_config", {})
+
+    exec_id = alert.get("execution_id", "—")
+    p_name = alert.get("project_name", "—")
+    ds_name = alert.get("dataset_name", "—")
+    r_name = alert.get("rule_name", "—")
+    sev = alert.get("severity", "High")
+    notif_st = str(alert.get("notification_status") or "PENDING").upper()
+    fail_reason = alert.get("failure_reason") or (logs[0].get("error_message") if logs else "No detailed failure message recorded.")
+
+    team_email = proj.get("project_team_email") or "Not configured"
+    addl_emails = proj.get("additional_emails") or "None"
+    notif_enabled = proj.get("notification_enabled", True)
+
+    sev_color = "#DC2626" if sev == "Critical" else ("#EA580C" if sev == "High" else "#D97706")
+    badge_bg = "#FEE2E2" if sev == "Critical" else ("#FFEDD5" if sev == "High" else "#FEF3C7")
+
+    attempt_rows = []
+    for l in logs:
+        st = l.get("delivery_status", "UNKNOWN")
+        st_color = "#15803D" if st in ("SENT", "DELIVERED") else ("#DC2626" if st == "FAILED" else "#B45309")
+        attempt_rows.append(html.Tr([
+            html.Td(str(l.get("sent_at") or l.get("last_attempt_timestamp") or "—"), style={"fontSize": "0.75rem"}),
+            html.Td(str(l.get("recipient_email") or "—"), style={"fontFamily": "monospace", "fontSize": "0.8rem"}),
+            html.Td(html.Span(st, style={"color": st_color, "fontWeight": "bold", "fontSize": "0.75rem"})),
+            html.Td(str(l.get("provider") or "SMTP"), style={"fontSize": "0.8rem"}),
+            html.Td(str(l.get("retry_count", 0)), style={"fontSize": "0.8rem"}),
+            html.Td(str(l.get("error_message") or "Success"), style={"fontSize": "0.75rem", "color": "#64748B"}),
+        ]))
 
     return html.Div([
-        # Header Bar
+        html.Div(id="modal-notif-retry-feedback", className="mb-3"),
+
         html.Div([
-            html.H3([
-                html.I(className="bi bi-bell text-primary"),
-                "Alerts & Reports"
-            ], className="page-main-title"),
-        ], className="page-header-bar"),
-
-        # Top Row: 4 KPI Cards
-        dbc.Row(kpi_cols, className="g-3 mb-2"),
-
-        # Middle Row: Severity Bar Chart & Report Downloader
-        dbc.Row([
-            dbc.Col(
-                html.Div([
-                    html.Div("Alerts by Severity", className="dq-card-title", style={"marginBottom": "8px"}),
-                    dcc.Graph(figure=fig_bar, config={"displayModeBar": False}),
-                ], className="dq-card"),
-                lg=5, className="mb-4",
-            ),
-            dbc.Col(
-                html.Div([
-                    html.Div("Download Standard Reports (CSV)", className="dq-card-title"),
-                    html.P("Export aggregate or detailed data quality intelligence across projects, datasets, and rules.", className="text-muted small mb-3"),
-                    dbc.Row([
-                        dbc.Col([
-                            dbc.Label("Select Report Type", className="fw-semibold small"),
-                            dbc.Select(
-                                id="select-report-type",
-                                options=[
-                                    {"label": "Project-wise Summary Report", "value": "PROJECT_WISE"},
-                                    {"label": "Dataset-wise Definitions & Health", "value": "DATASET_WISE"},
-                                    {"label": "Rule-wise Detailed Results", "value": "RULE_WISE"},
-                                    {"label": "Execution-wise Run History", "value": "EXECUTION_WISE"},
-                                ],
-                                value="PROJECT_WISE",
-                                className="mb-3",
-                            ),
-                        ], md=8),
-                        dbc.Col([
-                            dbc.Button([
-                                html.I(className="bi bi-download me-2"),
-                                "Download CSV"
-                            ], id="btn-download-selected-report", color="primary", className="w-100 fw-semibold", style={"marginTop": "28px"}),
-                        ], md=4),
+            dbc.Row([
+                dbc.Col([
+                    html.Div("PROJECT & DATASET", className="text-muted small fw-bold"),
+                    html.Div(f"{p_name} / {ds_name}", className="fw-semibold text-dark"),
+                ], md=5),
+                dbc.Col([
+                    html.Div("RULE & SEVERITY", className="text-muted small fw-bold"),
+                    html.Div([
+                        html.Span(r_name, className="me-2 fw-semibold"),
+                        html.Span(sev, style={"backgroundColor": badge_bg, "color": sev_color, "padding": "2px 8px", "borderRadius": "10px", "fontSize": "0.75rem", "fontWeight": "bold"}),
                     ]),
-                ], className="dq-card"),
-                lg=7, className="mb-4",
-            ),
-        ], className="g-3"),
+                ], md=4),
+                dbc.Col([
+                    html.Div("NOTIFICATION STATUS", className="text-muted small fw-bold"),
+                    html.Span(notif_st, className="badge", style={
+                        "backgroundColor": "#FEE2E2" if notif_st == "FAILED" else "#DCFCE7",
+                        "color": "#DC2626" if notif_st == "FAILED" else "#15803D",
+                        "fontSize": "0.8rem", "fontWeight": "bold"
+                    }),
+                ], md=3),
+            ]),
+        ], className="p-3 bg-light rounded border mb-3"),
 
-        # Recent Alerts Table Card
+        html.Div([
+            html.Div([
+                html.I(className="bi bi-exclamation-triangle-fill text-danger me-2"),
+                html.Strong("Failure Root Cause & Diagnostic Reason", className="text-danger"),
+            ], className="mb-2"),
+            html.Div(fail_reason, className="p-2 rounded font-monospace small mb-2",
+                     style={"backgroundColor": "#FEF2F2", "border": "1px solid #FECACA", "color": "#991B1B"}),
+            html.Div([
+                html.Span("Resolution Guidance: ", className="fw-bold small text-dark"),
+                html.Span(
+                    "Configure your SMTP server host, port, and credentials in the .env file or click 'Email Configuration & Health Check' to configure and test credentials.",
+                    className="small text-muted"
+                ),
+            ]),
+        ], className="p-3 rounded border mb-3", style={"backgroundColor": "#FFF5F5", "borderLeft": "4px solid #DC2626"}),
+
+        html.Div([
+            html.Div("Registered Project Notification Recipients", className="fw-bold text-dark small mb-2"),
+            dbc.Row([
+                dbc.Col([
+                    html.Div("Primary Project Team Email:", className="text-muted small"),
+                    html.Div(team_email, className="fw-semibold text-primary font-monospace small"),
+                ], md=6),
+                dbc.Col([
+                    html.Div("Additional Stakeholder Emails:", className="text-muted small"),
+                    html.Div(addl_emails, className="text-dark font-monospace small"),
+                ], md=6),
+            ]),
+            html.Div([
+                html.Span("Notification Enabled for Project: ", className="text-muted small"),
+                html.Span("Active (Enabled)" if notif_enabled else "Disabled",
+                          className="fw-bold small " + ("text-success" if notif_enabled else "text-danger")),
+            ], className="mt-2"),
+        ], className="p-3 bg-white rounded border mb-3"),
+
+        html.Div([
+            html.Div(f"Delivery Attempt History ({len(logs)} records)", className="fw-bold text-dark small mb-2"),
+            html.Div(html.Table([
+                html.Thead(html.Tr([
+                    html.Th("Timestamp", style={"fontSize": "0.75rem"}),
+                    html.Th("Recipient", style={"fontSize": "0.75rem"}),
+                    html.Th("Status", style={"fontSize": "0.75rem"}),
+                    html.Th("Provider", style={"fontSize": "0.75rem"}),
+                    html.Th("Retries", style={"fontSize": "0.75rem"}),
+                    html.Th("Error Message", style={"fontSize": "0.75rem"}),
+                ])),
+                html.Tbody(attempt_rows or [html.Tr([html.Td("No delivery attempts recorded.", colSpan=6, className="text-center text-muted small")])]),
+            ], className="table table-sm table-bordered mb-0"), style={"maxHeight": "180px", "overflowY": "auto"}),
+        ], className="p-3 bg-white rounded border"),
+    ])
+
+
+def _render_email_config_modal_body():
+    cfg = email_service.get_smtp_config()
+    is_cfg = cfg.get("configured", False)
+    provider = cfg.get("provider", "Not Configured")
+    host = cfg.get("host") or ""
+    port = cfg.get("port", 587)
+    sender = cfg.get("sender") or "dq-alerts@company.com"
+    masked_user = cfg.get("masked_user") or "Not configured"
+    has_pwd = cfg.get("has_password", False)
+    use_tls = cfg.get("use_tls", True)
+    use_ssl = cfg.get("use_ssl", False)
+
+    status_badge = html.Span("CONFIGURED" if is_cfg else "NOT CONFIGURED",
+                             className="badge ms-2",
+                             style={"backgroundColor": "#DCFCE7" if is_cfg else "#FEE2E2",
+                                    "color": "#15803D" if is_cfg else "#DC2626",
+                                    "fontSize": "0.75rem", "fontWeight": "bold"})
+
+    return html.Div([
+        html.Div([
+            html.Div([
+                html.Span([html.I(className="bi bi-shield-lock-fill text-primary me-2"), "Current Notification Service Status"], className="fw-bold text-dark"),
+                status_badge,
+            ], className="d-flex align-items-center justify-content-between mb-3"),
+
+            dbc.Row([
+                dbc.Col([
+                    html.Div("Email Provider:", className="text-muted small"),
+                    html.Div(provider, className="fw-semibold text-dark small"),
+                ], md=4, className="mb-2"),
+                dbc.Col([
+                    html.Div("SMTP Host & Port:", className="text-muted small"),
+                    html.Div(f"{host or '—'}:{port}", className="fw-semibold text-dark font-monospace small"),
+                ], md=4, className="mb-2"),
+                dbc.Col([
+                    html.Div("Sender Address:", className="text-muted small"),
+                    html.Div(sender, className="fw-semibold text-dark font-monospace small"),
+                ], md=4, className="mb-2"),
+                dbc.Col([
+                    html.Div("Authenticated User:", className="text-muted small"),
+                    html.Div(masked_user, className="fw-semibold text-dark font-monospace small"),
+                ], md=4),
+                dbc.Col([
+                    html.Div("Password / Secret:", className="text-muted small"),
+                    html.Div("•••••••• (Configured)" if has_pwd else "Not set", className="text-dark small"),
+                ], md=4),
+                dbc.Col([
+                    html.Div("Encryption:", className="text-muted small"),
+                    html.Div(f"TLS: {'Yes' if use_tls else 'No'} | SSL: {'Yes' if use_ssl else 'No'}", className="text-dark small"),
+                ], md=4),
+            ]),
+
+            (dbc.Alert([
+                html.I(className="bi bi-exclamation-triangle-fill me-2"),
+                "Email notifications are currently failing because SMTP credentials are not set. "
+                "Fill in the form below to configure your SMTP provider or configure environment variables."
+            ], color="warning", className="mt-3 mb-0 py-2 small") if not is_cfg else html.Div()),
+        ], className="p-3 bg-light rounded border mb-3"),
+
+        html.Div([
+            html.Div("Diagnostic Tools & Verification", className="fw-bold text-dark small mb-2"),
+            dbc.Row([
+                dbc.Col([
+                    dbc.Button([html.I(className="bi bi-plug-fill me-1"), "Test SMTP Connection"],
+                               id="btn-test-smtp-conn", color="primary", outline=True, size="sm", className="w-100 fw-semibold"),
+                    html.Div(id="smtp-test-conn-result", className="mt-2"),
+                ], md=6),
+                dbc.Col([
+                    html.Div([
+                        dbc.Input(id="input-test-email-addr", placeholder="Recipient (e.g. manjulamuthu2004@gmail.com)",
+                                  value="manjulamuthu2004@gmail.com", size="sm", className="mb-1"),
+                        dbc.Button([html.I(className="bi bi-send-fill me-1"), "Send Verification Email"],
+                                   id="btn-send-test-email-action", color="success", size="sm", className="w-100 fw-semibold"),
+                    ]),
+                    html.Div(id="smtp-test-email-result", className="mt-2"),
+                ], md=6),
+            ]),
+        ], className="p-3 bg-white rounded border mb-3"),
+
+        html.Div([
+            html.Div([
+                html.Span("Configure / Update SMTP Credentials", className="fw-bold text-dark small"),
+                html.Span("Saved securely to local .env and environment", className="text-muted small"),
+            ], className="d-flex justify-content-between align-items-center mb-3"),
+
+            dbc.Row([
+                dbc.Col([
+                    dbc.Label("SMTP Host *", className="small fw-semibold mb-1"),
+                    dbc.Input(id="smtp-cfg-host", placeholder="e.g. smtp.gmail.com", value=host, size="sm"),
+                ], md=6, className="mb-2"),
+                dbc.Col([
+                    dbc.Label("SMTP Port *", className="small fw-semibold mb-1"),
+                    dbc.Input(id="smtp-cfg-port", type="number", placeholder="587", value=port, size="sm"),
+                ], md=3, className="mb-2"),
+                dbc.Col([
+                    dbc.Label("Sender Email *", className="small fw-semibold mb-1"),
+                    dbc.Input(id="smtp-cfg-sender", placeholder="e.g. dq-alerts@company.com", value=sender, size="sm"),
+                ], md=3, className="mb-2"),
+                dbc.Col([
+                    dbc.Label("Username / Email *", className="small fw-semibold mb-1"),
+                    dbc.Input(id="smtp-cfg-user", placeholder="e.g. user@gmail.com", value=cfg.get("user", ""), size="sm"),
+                ], md=6, className="mb-2"),
+                dbc.Col([
+                    dbc.Label("Password / App Password *", className="small fw-semibold mb-1"),
+                    dbc.Input(id="smtp-cfg-pass", type="password", placeholder="Enter SMTP password or App Password", size="sm"),
+                ], md=6, className="mb-2"),
+            ]),
+
+            dbc.Row([
+                dbc.Col([
+                    dbc.Checkbox(id="smtp-cfg-tls", label="Enable STARTTLS (Port 587 recommended)", value=use_tls, className="small me-3"),
+                    dbc.Checkbox(id="smtp-cfg-ssl", label="Enable SSL/TLS (Port 465)", value=use_ssl, className="small"),
+                ], md=8),
+                dbc.Col([
+                    dbc.Button([html.I(className="bi bi-save me-1"), "Save & Apply Settings"],
+                               id="btn-save-smtp-cfg", color="primary", size="sm", className="w-100 fw-semibold"),
+                ], md=4),
+            ], className="align-items-center mt-2"),
+
+            html.Div(id="smtp-cfg-save-alert", className="mt-2"),
+        ], className="p-3 bg-white rounded border"),
+    ])
+
+
+def page_alerts():
+    projects = db_adapter.get_projects_list()["project_name"].tolist()
+
+    def _sel(id_, opts, width, value="All"):
+        return dbc.Select(id=id_, options=opts, value=value, style={"width": width}, size="sm", className="me-2 mb-1")
+
+    return html.Div([
+        dcc.Store(id="store-current-notif-alert-id"),
+        html.Div([
+            html.H3([html.I(className="bi bi-bell text-primary me-2"), "Alerts & Reports"], className="page-main-title mb-0"),
+            html.Div([
+                dbc.Button([html.I(className="bi bi-gear-fill me-2"), "Email Configuration & Health Check"],
+                           id="btn-open-email-config", color="light", size="sm", className="border fw-semibold shadow-sm"),
+            ]),
+        ], className="page-header-bar d-flex justify-content-between align-items-center mb-3"),
+        html.Div(id="alerts-kpi-row"),
+        dbc.Row([
+            dbc.Col(html.Div([
+                html.Div("Alerts by Severity", className="dq-card-title", style={"marginBottom": "8px"}),
+                dcc.Graph(id="alerts-severity-chart", config={"displayModeBar": False}),
+            ], className="dq-card"), lg=5, className="mb-4"),
+            dbc.Col(html.Div([
+                html.Div("Download Standard Reports (CSV)", className="dq-card-title"),
+                html.P("Export aggregate or detailed data quality intelligence across projects, datasets, and rules.", className="text-muted small mb-3"),
+                dbc.Row([
+                    dbc.Col([
+                        dbc.Label("Select Report Type", className="fw-semibold small"),
+                        dbc.Select(id="select-report-type", options=[{"label": l, "value": v} for l, v in REPORT_TYPES],
+                                   value="PROJECT_WISE", className="mb-3"),
+                    ], md=8),
+                    dbc.Col(dbc.Button([html.I(className="bi bi-download me-2"), "Download CSV"],
+                                       id="btn-download-selected-report", color="primary", className="w-100 fw-semibold",
+                                       style={"marginTop": "28px"}), md=4),
+                ]),
+            ], className="dq-card"), lg=7, className="mb-4"),
+        ], className="g-3"),
         html.Div([
             html.Div([
                 html.Span("Alerts Lifecycle & Resolution"),
                 html.Div([
-                    dbc.Select(
-                        id="filter-alert-status",
-                        options=[
-                            {"label": "Status: All", "value": "All"},
-                            {"label": "Active", "value": "Active"},
-                            {"label": "Acknowledged", "value": "Acknowledged"},
-                            {"label": "Closed", "value": "Closed"},
-                        ],
-                        value="All",
-                        style={"width": "150px"},
-                        size="sm",
-                        className="d-inline-block me-2",
-                    ),
-                    dbc.Select(
-                        id="filter-alert-severity",
-                        options=[
-                            {"label": "Severity: All", "value": "All"},
-                            {"label": "Critical", "value": "Critical"},
-                            {"label": "High", "value": "High"},
-                            {"label": "Medium", "value": "Medium"},
-                            {"label": "Low", "value": "Low"},
-                        ],
-                        value="All",
-                        style={"width": "150px"},
-                        size="sm",
-                        className="d-inline-block",
-                    ),
-                ], className="d-flex"),
+                    _sel("filter-alert-project", [{"label": "Project: All", "value": "All"}] + [{"label": p, "value": p} for p in projects], "150px"),
+                    _sel("filter-alert-dataset", [{"label": "Dataset: All", "value": "All"}], "150px"),
+                    _sel("filter-alert-severity", [{"label": "Severity: All", "value": "All"}] + [{"label": s, "value": s} for s in ("Critical", "High", "Medium", "Low")], "140px"),
+                    _sel("filter-alert-status", [{"label": "Status: All", "value": "All"}] + [{"label": s, "value": s} for s in ("Active", "Acknowledged", "Closed")], "150px"),
+                    dbc.Input(id="filter-alert-search", placeholder="Search...", size="sm", style={"width": "150px"}, debounce=True),
+                ], className="d-flex flex-wrap"),
             ], className="dq-card-title"),
-            html.Table([
-                html.Thead(html.Tr([
-                    html.Th("Date & Time"),
-                    html.Th("Project"),
-                    html.Th("Rule"),
-                    html.Th("Severity"),
-                    html.Th("Failures"),
-                    html.Th("Status"),
-                    html.Th("Actions"),
-                ])),
-                html.Tbody(id="alerts-table-body", children=alert_rows),
-            ], className="clean-table"),
+            html.Div(html.Table([
+                html.Thead(html.Tr([html.Th(h) for h in ("Date & Time", "Execution ID", "Project", "Dataset", "Rule", "Severity", "Failures", "Notification Status", "Alert Status", "Actions")])),
+                html.Tbody(id="alerts-table-body"),
+            ], className="clean-table"), style={"overflowX": "auto"}),
         ], className="dq-card mb-4"),
+
+        # Notification Failure Details Modal
+        dbc.Modal([
+            dbc.ModalHeader(dbc.ModalTitle(id="notif-detail-modal-title", children="Notification Delivery Details"), close_button=True),
+            dbc.ModalBody(id="notif-detail-modal-body", children=[html.Div("Loading notification details...")]),
+            dbc.ModalFooter([
+                dbc.Button([html.I(className="bi bi-arrow-repeat me-1"), "Retry Notification Now"],
+                           id="btn-modal-retry-notif-action", color="warning", className="fw-semibold me-2"),
+                dbc.Button("Close", id="btn-close-notif-detail-modal", color="secondary", outline=True),
+            ]),
+        ], id="modal-notif-detail", size="lg", is_open=False),
+
+        # Email Configuration & Health Check Modal
+        dbc.Modal([
+            dbc.ModalHeader(dbc.ModalTitle([html.I(className="bi bi-envelope-gear text-primary me-2"), "Email Notification Configuration & Diagnostic Tools"]), close_button=True),
+            dbc.ModalBody(id="email-config-modal-body", children=[html.Div("Loading configuration...")]),
+            dbc.ModalFooter([
+                dbc.Button("Close", id="btn-close-email-config-modal", color="secondary", outline=True),
+            ]),
+        ], id="modal-email-config", size="lg", is_open=False),
     ])
 
 # -------------------------------------------------------------
@@ -1811,7 +3366,9 @@ def render_page(pathname):
     [Output("new-project-name", "value"),
      Output("new-project-desc", "value"),
      Output("new-project-owner", "value"),
-     Output("new-project-domain", "value"),
+     Output("new-project-team-email", "value"),
+     Output("new-project-additional-emails", "value"),
+     Output("new-project-notif-enabled", "value"),
      Output("new-project-source-table", "value"),
      Output("new-project-target-table", "value"),
      Output("new-project-business-key", "value")],
@@ -1823,7 +3380,9 @@ def handle_autofill_example(n_clicks):
         "Banking",
         "Customer transaction data quality",
         "Data Engineering Team",
-        "Banking",
+        "banking-dq-team@company.com",
+        "alerts-oncall@company.com",
+        ["enabled"],
         "banking_catalog.finance.customer_source",
         "banking_catalog.finance.customer_target",
         "customer_id",
@@ -1833,14 +3392,16 @@ def handle_autofill_example(n_clicks):
 @app.callback(
     Output("connectivity-test-alert", "children"),
     Input("btn-test-connectivity", "n_clicks"),
-    State("new-project-source-table", "value"),
+    [State("new-project-source-table", "value"),
+     State("new-project-target-table", "value"),
+     State("new-project-business-key", "value")],
     prevent_initial_call=True,
 )
-def handle_test_connectivity(n_clicks, src_table):
+def handle_test_connectivity(n_clicks, src_table, tgt_table, b_key):
     if not src_table or not src_table.strip():
         return dbc.Alert("Please provide a Source Table before testing connectivity.", color="warning", className="small py-2 mb-0")
     
-    res = db_adapter.test_table_connectivity(src_table.strip())
+    res = db_adapter.test_table_connectivity(src_table.strip(), (tgt_table or "").strip() or None, (b_key or "").strip() or None)
     if res["success"]:
         return dbc.Alert([
             html.I(className="bi bi-check-circle-fill me-2"),
@@ -1867,28 +3428,36 @@ def handle_test_connectivity(n_clicks, src_table):
      State("new-project-name", "value"),
      State("new-project-desc", "value"),
      State("new-project-owner", "value"),
-     State("new-project-domain", "value"),
+     State("new-project-team-email", "value"),
+     State("new-project-additional-emails", "value"),
+     State("new-project-notif-enabled", "value"),
      State("new-project-source-table", "value"),
      State("new-project-target-table", "value"),
      State("new-project-business-key", "value")],
     prevent_initial_call=True,
 )
-def handle_add_project(open_click, cancel_click, submit_click, is_open, name, desc, owner, domain, src_tbl, tgt_tbl, b_key):
+def handle_add_project(open_click, cancel_click, submit_click, is_open, name, desc, owner, team_email, add_emails, notif_enabled, src_tbl, tgt_tbl, b_key):
     trig = ctx.triggered_id
     _ts = datetime.now().isoformat()
+    if not trig or not _real_click():
+        return (dash.no_update,) * 6
     if trig == "btn-open-add-project":
         return True, None, False, "", "info", dash.no_update
     elif trig == "btn-cancel-add-project":
         return False, None, False, "", "info", dash.no_update
     elif trig == "btn-submit-add-project":
+        is_notif_enabled = bool("enabled" in (notif_enabled or []))
         res = db_adapter.add_new_project_with_dataset(
             project_name=name,
             description=desc or "",
             owner=owner or "Data Engineering Team",
-            domain=domain or "Banking",
+            domain=None,
             source_table=src_tbl or "",
             target_table=tgt_tbl or src_tbl,
             business_key=b_key or "id",
+            project_team_email=team_email or "",
+            additional_emails=add_emails or "",
+            notification_enabled=is_notif_enabled,
             user="admin"
         )
         if res["success"]:
@@ -1906,9 +3475,10 @@ def handle_add_project(open_click, cancel_click, submit_click, is_open, name, de
             # Close modal, show success, refresh table
             return False, success_content, True, f"Project '{name}' registered successfully!", "success", _ts
         else:
+            err_msg = res.get("error") or res.get("message") or "Registration failed."
             err_content = dbc.Alert([
                 html.I(className="bi bi-exclamation-triangle-fill me-2"),
-                res["message"]
+                err_msg
             ], color="danger", className="small py-2 mb-0")
             return True, err_content, False, "", "info", dash.no_update
     return is_open, None, False, "", "info", dash.no_update
@@ -1925,14 +3495,49 @@ def handle_add_project(open_click, cancel_click, submit_click, is_open, name, de
 )
 def handle_view_project(view_clicks, close_click, is_open):
     trig = ctx.triggered_id
+    
+    # NEVER open modal unless explicitly triggered by a button click
+    if trig is None:
+        return dash.no_update, dash.no_update, dash.no_update
+    
     if trig == "btn-close-view-project":
         return False, "Project Details", None
+
+    # Table re-render fires the pattern input with n_clicks=None; ignore it.
+    if isinstance(trig, dict) and not _real_click():
+        return dash.no_update, dash.no_update, dash.no_update
     
     if isinstance(trig, dict) and trig.get("type") == "btn-view-proj":
         p_id = trig["id"]
+        return True, *_build_project_view(p_id)
+
+    # Default: NEVER open modal for any other reason
+    return dash.no_update, dash.no_update, dash.no_update
+
+
+# 4b. Enable / Disable an individual dataset from inside the View Project modal
+@app.callback(
+    [Output("modal-view-project-title", "children", allow_duplicate=True),
+     Output("modal-view-project-body", "children", allow_duplicate=True),
+     Output("project-refresh-store", "data", allow_duplicate=True)],
+    Input({"type": "btn-toggle-ds", "id": dash.ALL, "project": dash.ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def handle_toggle_dataset(clicks):
+    trig = ctx.triggered_id
+    if not isinstance(trig, dict) or not _real_click():
+        return dash.no_update, dash.no_update, dash.no_update
+    db_adapter.toggle_dataset(int(trig["id"]))
+    title, body = _build_project_view(int(trig["project"]))
+    return title, body, datetime.now().isoformat()
+
+
+def _build_project_view(p_id):
+    """Builds (title, body) for the View Project modal."""
+    if True:
         details = db_adapter.get_project_details(p_id)
         if not details:
-            return False, "Project Details", None
+            return "Project Details", html.Div("Project not found.", className="text-muted")
         
         proj = details["project"]
         datasets = details["datasets"]
@@ -1944,12 +3549,19 @@ def handle_view_project(view_clicks, close_click, is_open):
         # Datasets Table Rows
         ds_rows = []
         for d in datasets:
+            d_active = bool(d["active"])
             ds_rows.append(html.Tr([
                 html.Td(d["dataset_name"], style={"fontWeight": "600"}),
-                html.Td(html.Code(d["source_table"])),
-                html.Td(html.Code(d["target_table"] or "—")),
+                html.Td(html.Code(d["source_table"], style={"fontSize": "0.75rem", "whiteSpace": "normal", "wordBreak": "break-all"})),
+                html.Td(html.Code(d["target_table"] or "—", style={"fontSize": "0.75rem", "whiteSpace": "normal", "wordBreak": "break-all"})),
                 html.Td(dbc.Badge(d["business_key"] or "id", color="secondary", className="px-2 py-1")),
-                html.Td(html.Span("Active", className="badge-active") if d["active"] else html.Span("Inactive", className="badge-inactive")),
+                html.Td(html.Span("Active", className="badge-active") if d_active else html.Span("Inactive", className="badge-inactive")),
+                html.Td(dbc.Button(
+                    "Disable" if d_active else "Enable",
+                    id={"type": "btn-toggle-ds", "id": int(d["dataset_id"]), "project": int(p_id)},
+                    size="sm", color="danger" if d_active else "success", outline=True,
+                    style={"fontSize": "0.72rem", "padding": "2px 8px"},
+                )),
             ]))
 
         # Rules Table Rows
@@ -1965,6 +3577,27 @@ def handle_view_project(view_clicks, close_click, is_open):
                 html.Td(str(r["threshold"])),
                 html.Td(html.Span(r["severity"], className=f"badge text-bg-{badge_color}")),
             ]))
+
+        # Notification Settings Section
+        notif_enabled = bool(proj.get("notification_enabled", 1))
+        team_email = proj.get("project_team_email") or "—"
+        add_emails = proj.get("additional_emails") or "—"
+        notif_badge = dbc.Badge("Enabled", color="success", className="px-2 py-1") if notif_enabled else dbc.Badge("Disabled", color="secondary", className="px-2 py-1")
+
+        notif_widget = dbc.Row([
+            dbc.Col([
+                html.Div("Notification Alerts", className="small text-muted fw-semibold"),
+                html.Div(notif_badge, className="mt-1"),
+            ], md=3, className="mb-2"),
+            dbc.Col([
+                html.Div("Project Team Email", className="small text-muted fw-semibold"),
+                html.Div(team_email, className="fw-semibold text-dark", style={"wordBreak": "break-all"}),
+            ], md=5, className="mb-2"),
+            dbc.Col([
+                html.Div("Additional Recipients", className="small text-muted fw-semibold"),
+                html.Div(add_emails, className="text-secondary small", style={"wordBreak": "break-all"}),
+            ], md=4, className="mb-2"),
+        ], className="p-3 bg-light rounded mb-3 border")
 
         # Last Execution Summary
         if last_exec:
@@ -2012,307 +3645,1552 @@ def handle_view_project(view_clicks, close_click, is_open):
 
             html.P(proj["description"] or "No description provided.", className="text-muted small mb-3"),
 
+            # Notification Settings Section
+            html.H6("Notification & Alert Settings", className="fw-bold text-dark mb-2"),
+            notif_widget,
+
             # Execution History Section
             html.H6("Recent Execution Status", className="fw-bold text-dark mb-2"),
             exec_widget,
 
             # Registered Datasets Section
             html.H6(f"Registered Datasets ({len(datasets)})", className="fw-bold text-dark mb-2"),
-            html.Table([
-                html.Thead(html.Tr([
-                    html.Th("Dataset"),
-                    html.Th("Source Table"),
-                    html.Th("Target Table"),
-                    html.Th("Business Key"),
-                    html.Th("Status"),
-                ])),
-                html.Tbody(ds_rows if ds_rows else [html.Tr([html.Td("No datasets registered", colSpan=5, className="text-center text-muted")])]),
-            ], className="clean-table mb-4"),
+            html.Div([
+                html.Table([
+                    html.Thead(html.Tr([
+                        html.Th("Dataset"),
+                        html.Th("Source Table"),
+                        html.Th("Target Table"),
+                        html.Th("Business Key"),
+                        html.Th("Status"),
+                        html.Th("Action"),
+                    ])),
+                    html.Tbody(ds_rows if ds_rows else [html.Tr([html.Td("No datasets registered", colSpan=6, className="text-center text-muted")])]),
+                ], className="clean-table"),
+            ], style={"overflowX": "auto", "marginBottom": "1.5rem"}),
 
             # Configured DQ Rules Section
             html.H6(f"Active DQ Rules ({len(rules)})", className="fw-bold text-dark mb-2"),
-            html.Table([
-                html.Thead(html.Tr([
-                    html.Th("Rule Name"),
-                    html.Th("Category"),
-                    html.Th("Template"),
-                    html.Th("Column"),
-                    html.Th("Threshold"),
-                    html.Th("Severity"),
-                ])),
-                html.Tbody(rule_rows if rule_rows else [html.Tr([html.Td("No rules configured for this project", colSpan=6, className="text-center text-muted")])]),
-            ], className="clean-table"),
+            html.Div([
+                html.Table([
+                    html.Thead(html.Tr([
+                        html.Th("Rule Name"),
+                        html.Th("Category"),
+                        html.Th("Template"),
+                        html.Th("Column"),
+                        html.Th("Threshold"),
+                        html.Th("Severity"),
+                    ])),
+                    html.Tbody(rule_rows if rule_rows else [html.Tr([html.Td("No rules configured for this project", colSpan=6, className="text-center text-muted")])]),
+                ], className="clean-table"),
+            ], style={"overflowX": "auto"}),
         ])
 
-        return True, f"Project Overview: {p_name}", body
-
-    return is_open, "Project Details", None
+        return f"Project Overview: {p_name}", body
 
 # 5. Edit Project Configuration Action
 @app.callback(
     [Output("modal-edit-project", "is_open"),
      Output("edit-project-id", "data"),
-     Output("edit-dataset-id", "data"),
      Output("edit-project-name", "value"),
      Output("edit-project-desc", "value"),
      Output("edit-project-owner", "value"),
-     Output("edit-project-source", "value"),
-     Output("edit-project-target", "value"),
-     Output("edit-project-business-key", "value"),
-     Output("project-refresh-store", "data", allow_duplicate=True)],
+     Output("edit-project-team-email", "value"),
+     Output("edit-project-additional-emails", "value"),
+     Output("edit-project-notif-enabled", "value"),
+     Output("project-refresh-store", "data", allow_duplicate=True),
+     Output("global-toast", "is_open", allow_duplicate=True),
+     Output("global-toast", "children", allow_duplicate=True),
+     Output("global-toast", "icon", allow_duplicate=True)],
     [Input({"type": "btn-edit-proj", "id": dash.ALL}, "n_clicks"),
      Input("btn-cancel-edit-project", "n_clicks"),
      Input("btn-submit-edit-project", "n_clicks")],
     [State("modal-edit-project", "is_open"),
      State("edit-project-id", "data"),
-     State("edit-dataset-id", "data"),
      State("edit-project-name", "value"),
      State("edit-project-desc", "value"),
      State("edit-project-owner", "value"),
-     State("edit-project-source", "value"),
-     State("edit-project-target", "value"),
-     State("edit-project-business-key", "value")],
+     State("edit-project-team-email", "value"),
+     State("edit-project-additional-emails", "value"),
+     State("edit-project-notif-enabled", "value")],
     prevent_initial_call=True,
 )
-def handle_edit_project(edit_clicks, cancel_click, submit_click, is_open, cur_p_id, cur_d_id, p_name, p_desc, p_owner, p_src, p_tgt, p_key):
+def handle_edit_project(edit_clicks, cancel_click, submit_click, is_open, cur_p_id, p_name, p_desc, p_owner, p_team_email, p_add_emails, p_notif_enabled):
     trig = ctx.triggered_id
     _ts = datetime.now().isoformat()
+    
+    # Only proceed if a button was actually clicked
+    if not trig:
+        return (dash.no_update,) * 12
+    # Table re-render fires the pattern input with n_clicks=None; ignore it.
+    if isinstance(trig, dict) and not _real_click():
+        return (dash.no_update,) * 12
+    
     if trig == "btn-cancel-edit-project":
-        return False, None, None, "", "", "", "", "", "", dash.no_update
+        return False, None, "", "", "", "", "", ["enabled"], dash.no_update, False, "", "info"
+
     elif trig == "btn-submit-edit-project":
-        if cur_p_id and p_name:
-            db_adapter.update_project_and_dataset(
-                project_id=int(cur_p_id),
-                project_name=p_name.strip(),
-                description=p_desc or "",
-                owner=p_owner or "Data Engineering Team",
-                dataset_id=int(cur_d_id) if cur_d_id else None,
-                source_table=p_src,
-                target_table=p_tgt,
-                business_key=p_key,
-                user="admin"
-            )
-        # Refresh table after saving edits
-        return False, None, None, "", "", "", "", "", "", _ts
+        if not cur_p_id:
+            return False, None, "", "", "", "", "", ["enabled"], dash.no_update, True, "Error: Project ID is missing.", "danger"
+        if not p_name or not p_name.strip():
+            return True, cur_p_id, p_name, p_desc, p_owner, p_team_email, p_add_emails, p_notif_enabled, dash.no_update, True, "Project Name is required.", "danger"
+
+        is_notif_enabled = bool("enabled" in (p_notif_enabled or []))
+        res = db_adapter.update_project_and_dataset(
+            project_id=int(cur_p_id),
+            project_name=p_name.strip(),
+            description=(p_desc or "").strip(),
+            owner=(p_owner or "Data Engineering Team").strip(),
+            project_team_email=(p_team_email or "").strip(),
+            additional_emails=(p_add_emails or "").strip(),
+            notification_enabled=is_notif_enabled,
+            user="admin"
+        )
+        if res.get("success"):
+            return False, None, "", "", "", "", "", ["enabled"], _ts, True, f"Project '{p_name.strip()}' updated successfully!", "success"
+        else:
+            err_msg = res.get("message") or res.get("error") or "Update failed."
+            return True, cur_p_id, p_name, p_desc, p_owner, p_team_email, p_add_emails, p_notif_enabled, dash.no_update, True, err_msg, "danger"
+
     elif isinstance(trig, dict) and trig.get("type") == "btn-edit-proj":
-        p_id = trig["id"]
+        p_id = int(trig["id"])
         details = db_adapter.get_project_details(p_id)
-        if not details:
-            return False, None, None, "", "", "", "", "", "", dash.no_update
+        if not details or not details.get("project"):
+            return False, None, "", "", "", "", "", ["enabled"], dash.no_update, True, f"Project #{p_id} not found.", "danger"
 
         proj = details["project"]
-        ds_list = details["datasets"]
-        d = ds_list[0] if ds_list else {}
-
+        notif_val = ["enabled"] if proj.get("notification_enabled", 1) else []
         return (
             True,
             proj["project_id"],
-            d.get("dataset_id"),
             proj["project_name"],
-            proj["description"] or "",
+            proj.get("description") or "",
             proj.get("owner") or "Data Engineering Team",
-            d.get("source_table") or "",
-            d.get("target_table") or "",
-            d.get("business_key") or "id",
+            proj.get("project_team_email") or "",
+            proj.get("additional_emails") or "",
+            notif_val,
             dash.no_update,
+            False,
+            "",
+            "info",
         )
-    return is_open, None, None, "", "", "", "", "", "", dash.no_update
+    
+    # Default: NEVER open modal for any other reason
+    return (dash.no_update,) * 12
 
 # 2. Toggle Project Active Status & Alert Lifecycle
 @app.callback(
-    [Output("global-toast", "is_open"),
-     Output("global-toast", "children"),
-     Output("global-toast", "icon"),
-     Output("project-refresh-store", "data", allow_duplicate=True)],
+    [Output("global-toast", "is_open", allow_duplicate=True),
+     Output("global-toast", "children", allow_duplicate=True),
+     Output("global-toast", "icon", allow_duplicate=True),
+     Output("project-refresh-store", "data", allow_duplicate=True),
+     Output("alert-refresh-store", "data", allow_duplicate=True)],
     [Input({"type": "btn-toggle-proj", "id": dash.ALL}, "n_clicks"),
      Input({"type": "btn-ack-alert", "id": dash.ALL}, "n_clicks"),
-     Input({"type": "btn-close-alert", "id": dash.ALL}, "n_clicks")],
+     Input({"type": "btn-close-alert", "id": dash.ALL}, "n_clicks"),
+     Input({"type": "btn-retry-notif", "id": dash.ALL}, "n_clicks")],
     prevent_initial_call=True,
 )
-def handle_table_actions(toggle_clicks, ack_clicks, close_clicks):
+def handle_table_actions(toggle_clicks, ack_clicks, close_clicks, retry_clicks):
     trig = ctx.triggered_id
     _ts = datetime.now().isoformat()
-    if not trig:
-        return False, "", "info", dash.no_update
+    # Pattern-matching inputs fire with n_clicks=None whenever a table re-renders.
+    # Only act on a genuine click.
+    if not trig or not _real_click():
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
     if isinstance(trig, dict) and trig.get("type") == "btn-toggle-proj":
         p_id = trig["id"]
         db_adapter.toggle_project(p_id)
         # Refresh table so Enable/Disable label flips immediately
-        return True, f"Project ID {p_id} status updated successfully.", "success", _ts
+        return True, f"Project ID {p_id} status updated successfully.", "success", _ts, dash.no_update
 
     if isinstance(trig, dict) and trig.get("type") == "btn-ack-alert":
         a_id = trig["id"]
         db_adapter.acknowledge_alert(a_id, user="admin")
-        return True, f"Alert #{a_id} marked as Acknowledged.", "info", dash.no_update
+        return True, f"Alert #{a_id} marked as Acknowledged.", "info", dash.no_update, _ts
 
     if isinstance(trig, dict) and trig.get("type") == "btn-close-alert":
         a_id = trig["id"]
         db_adapter.close_alert(a_id, user="admin")
-        return True, f"Alert #{a_id} marked as Closed.", "success", dash.no_update
+        return True, f"Alert #{a_id} marked as Closed.", "success", dash.no_update, _ts
 
-    return False, "", "info", dash.no_update
+    if isinstance(trig, dict) and trig.get("type") == "btn-retry-notif":
+        a_id = trig["id"]
+        res = db_adapter.retry_notification(a_id, user="admin")
+        if res.get("success"):
+            return True, f"Notification retry succeeded for Alert #{a_id} ({res.get('status')}).", "success", dash.no_update, _ts
+        else:
+            err_detail = res.get("error") or res.get("message") or "Delivery failed"
+            return True, f"Notification retry failed for Alert #{a_id}: {err_detail}", "danger", dash.no_update, _ts
 
-# 2b. Live refresh of the management projects table body
-# Triggered whenever project-refresh-store is updated (after Add / Edit / Toggle).
-# Only active when the management page is currently displayed.
+    return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+# Management (Page 2) callbacks ---------------------------------------------
 @app.callback(
     Output("management-table-body", "children"),
-    Input("project-refresh-store", "data"),
-    prevent_initial_call=True,
+    [Input("project-refresh-store", "data"),
+     Input("input-search-project", "value"),
+     Input("filter-project-status", "value")],
 )
-def refresh_management_table(refresh_ts):
-    """Re-fetch projects from DB and rebuild the table rows in-place."""
-    projects_df = db_adapter.get_projects_list()
+def refresh_management_table(_refresh_ts, search_term, status_filter):
+    """Re-fetch projects from DB and filter by status and search keyword."""
+    projects_df = db_adapter.get_projects_list(status_filter=status_filter, search=search_term)
     return _build_management_table_rows(projects_df)
 
-# 3. Rule Template Selection & SQL Preview
+
+# -------------------------------------------------------------
+# DATASET REGISTRATION CALLBACKS (TWO OPTIONS: UPLOAD & EXISTING)
+# -------------------------------------------------------------
+
 @app.callback(
-    [Output("rule-input-name", "value"),
-     Output("rule-input-column", "value"),
-     Output("rule-input-threshold", "value")],
-    Input({"type": "template-tile", "id": dash.ALL}, "n_clicks"),
+    [Output("modal-add-dataset", "is_open"),
+     Output("add-dataset-project-id", "data"),
+     Output("select-dataset-target-project", "value"),
+     Output("dataset-registration-form-container", "style"),
+     Output("dataset-registration-status-card", "style"),
+     Output("dataset-registration-status-card", "children"),
+     Output("upload-preview-container", "children"),
+     Output("upload-file-store", "data"),
+     Output("upload-submit-alert", "children"),
+     Output("existing-submit-alert", "children")],
+    [Input({"type": "btn-open-add-ds", "id": dash.ALL}, "n_clicks"),
+     Input("btn-open-register-dataset", "n_clicks"),
+     Input("btn-cancel-add-dataset", "n_clicks")],
     prevent_initial_call=True,
 )
-def select_template(clicks):
+def handle_open_add_dataset(open_clicks, top_open_clicks, cancel_clicks):
     trig = ctx.triggered_id
-    if trig and isinstance(trig, dict):
-        t_id = trig["id"]
-        tmpl = RULE_TEMPLATES.get(t_id, {})
-        col = "patient_name" if tmpl.get("requires_column") else ""
-        thresh = str(tmpl.get("default_threshold", 0))
-        return t_id, col, thresh
-    return dash.no_update, dash.no_update, dash.no_update
+    if not trig or not _real_click():
+        return (dash.no_update,) * 10
 
-# 4. Preview SQL Modal
+    if trig == "btn-cancel-add-dataset":
+        return False, None, dash.no_update, {"display": "block"}, {"display": "none"}, None, None, None, None, None
+
+    if trig == "btn-open-register-dataset":
+        # Opened from top header button: select first project by default
+        projects_df = db_adapter.get_projects_list()
+        default_pid = int(projects_df.iloc[0]["project_id"]) if not projects_df.empty else 1
+        return True, default_pid, default_pid, {"display": "block"}, {"display": "none"}, None, None, None, None, None
+
+    if isinstance(trig, dict) and trig.get("type") == "btn-open-add-ds":
+        p_id = int(trig["id"])
+        return True, p_id, p_id, {"display": "block"}, {"display": "none"}, None, None, None, None, None
+
+    return (dash.no_update,) * 10
+
+
 @app.callback(
-    [Output("modal-preview-sql", "is_open"),
-     Output("preview-sql-code", "children")],
-    [Input("btn-preview-sql", "n_clicks"),
-     Input("btn-close-sql-modal", "n_clicks")],
-    [State("modal-preview-sql", "is_open"),
-     State("rule-input-name", "value"),
-     State("rule-input-column", "value"),
-     State("rule-input-threshold", "value")],
+    [Output("container-upload-dataset", "style"),
+     Output("container-existing-dataset", "style")],
+    Input("dataset-reg-method", "value"),
+)
+def toggle_dataset_reg_method(method):
+    if method == "existing":
+        return {"display": "none"}, {"display": "block"}
+    return {"display": "block"}, {"display": "none"}
+
+
+@app.callback(
+    [Output("upload-preview-container", "children", allow_duplicate=True),
+     Output("input-upload-dataset-name", "value"),
+     Output("input-upload-table-name", "value"),
+     Output("select-upload-business-key", "options"),
+     Output("select-upload-business-key", "value"),
+     Output("upload-file-store", "data", allow_duplicate=True)],
+    [Input("upload-dataset-file", "contents"),
+     Input("upload-dataset-file", "filename")],
     prevent_initial_call=True,
 )
-def toggle_preview_sql(open_click, close_click, is_open, rule_name, column, threshold):
-    if ctx.triggered_id == "btn-preview-sql":
-        rendered = render_sql(
-            template_name=rule_name or "NULL_COUNT",
-            source_table="hospital_catalog.healthcare.patients_source",
-            target_table="hospital_catalog.healthcare.patients_target",
-            column_name=column or "patient_name",
-            threshold=float(threshold) if threshold and threshold.isdigit() else 0,
-        )
-        return True, rendered
-    return False, ""
+def on_file_uploaded(contents, filename):
+    if not contents or not filename:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
-# 5. Save Rule Action
+    parsed = db_adapter.parse_uploaded_file(contents, filename)
+    if not parsed.get("success"):
+        err_box = dbc.Alert([
+            html.I(className="bi bi-exclamation-triangle-fill me-2"),
+            parsed.get("message", "Error parsing uploaded file.")
+        ], color="danger", className="py-2")
+        return err_box, dash.no_update, dash.no_update, [], None, None
+
+    # Build Preview Display
+    cols = parsed["columns"]
+    total_rows = parsed["total_rows"]
+    fmt = parsed["file_format"]
+    schema_info = parsed["schema_info"]
+    preview_rows = parsed["preview_rows"]
+
+    # Schema type badges
+    type_badges = []
+    for s in schema_info:
+        type_badges.append(html.Span([
+            html.Span(s["column"], className="fw-semibold text-dark me-1"),
+            html.Span(s["sql_type"], className="badge bg-light text-primary border me-2 small"),
+        ], className="d-inline-flex align-items-center mb-1"))
+
+    # Table preview
+    preview_table = html.Div([
+        html.Table([
+            html.Thead(html.Tr([html.Th(c, style={"fontSize": "0.78rem"}) for c in cols])),
+            html.Tbody([
+                html.Tr([html.Td(str(row.get(c, "")), style={"fontSize": "0.75rem"}) for c in cols])
+                for row in preview_rows[:5]
+            ]),
+        ], className="table table-sm table-striped table-bordered mb-0"),
+    ], style={"overflowX": "auto", "maxHeight": "200px"})
+
+    preview_ui = html.Div([
+        # File Metadata Badges
+        html.Div([
+            html.Span([html.I(className="bi bi-file-earmark-check-fill text-success me-1"), filename],
+                      className="badge bg-success-subtle text-success border border-success me-2 px-3 py-2"),
+            html.Span([html.I(className="bi bi-filetype-csv me-1"), f"Format: {fmt}"],
+                      className="badge bg-primary-subtle text-primary border border-primary me-2 px-3 py-2"),
+            html.Span([html.I(className="bi bi-list-ol me-1"), f"{total_rows:,} records detected"],
+                      className="badge bg-info-subtle text-info border border-info me-2 px-3 py-2"),
+            html.Span([html.I(className="bi bi-layout-three-columns me-1"), f"{len(cols)} columns detected"],
+                      className="badge bg-secondary-subtle text-secondary border me-2 px-3 py-2"),
+        ], className="d-flex flex-wrap align-items-center mb-3"),
+
+        # Detected Schema
+        html.Div([
+            html.Div("DETECTED SCHEMA & DATA TYPES", className="fw-bold text-muted small mb-2", style={"letterSpacing": "0.05em"}),
+            html.Div(type_badges, className="p-3 bg-white rounded border mb-3"),
+        ]),
+
+        # Sample Preview
+        html.Div([
+            html.Div(f"DATASET PREVIEW (First {min(5, total_rows)} of {total_rows:,} records)",
+                     className="fw-bold text-muted small mb-2", style={"letterSpacing": "0.05em"}),
+            html.Div(preview_table, className="border rounded bg-white p-2"),
+        ]),
+    ], className="p-3 bg-light rounded-3 border")
+
+    col_options = [{"label": f"{c} ({s['sql_type']})", "value": c} for c, s in zip(cols, schema_info)]
+    # Default business key to column containing id/key, or first column
+    def_b_key = next((c for c in cols if "id" in c.lower() or "key" in c.lower() or "num" in c.lower()), cols[0])
+
+    store_data = {
+        "contents": contents,
+        "filename": filename,
+        "file_format": fmt,
+        "total_rows": total_rows,
+        "columns": cols,
+        "schema_info": schema_info,
+    }
+
+    return (
+        preview_ui,
+        parsed["suggested_dataset_name"],
+        parsed["suggested_table_name"],
+        col_options,
+        def_b_key,
+        store_data
+    )
+
+
+# ── Option 2 Dynamic Unity Catalog Discovery Callbacks ──────────────────────
+
 @app.callback(
-    Output("btn-save-rule", "children"),
-    Input("btn-save-rule", "n_clicks"),
-    [State("rule-select-project", "value"),
-     State("rule-select-dataset", "value"),
-     State("rule-input-name", "value"),
-     State("rule-input-column", "value"),
-     State("rule-input-threshold", "value"),
-     State("rule-select-severity", "value"),
-     State("rule-switch-active", "value")],
+    Output("collapse-workspace-settings", "is_open"),
+    Input("btn-toggle-workspace-settings", "n_clicks"),
+    State("collapse-workspace-settings", "is_open"),
     prevent_initial_call=True,
 )
-def save_rule_action(n_clicks, proj, ds, name, col, thr, sev, active):
-    if name:
-        thr_val = float(thr) if (thr and thr.replace(".", "", 1).isdigit()) else 0.0
-        db_adapter.add_new_rule(
-            project_name=proj or "Hospital",
-            dataset_name=ds or "source_table",
-            rule_name=name.strip(),
-            template_name=name.strip(),
-            column_name=col.strip() if col else None,
-            threshold=thr_val,
-            severity=sev or "High",
-            active=bool(active),
-        )
-        return [html.I(className="bi bi-check2 me-1"), "Saved!"]
-    return "Save Rule"
+def toggle_workspace_settings(n_clicks, is_open):
+    if not _real_click():
+        return dash.no_update
+    return not is_open
 
-# 6. Trigger Validation Run
+
 @app.callback(
-    [Output("exec-meta-id", "children"),
+    [Output("workspace-connected-host", "children"),
+     Output("workspace-connected-auth", "children"),
+     Output("workspace-connect-alert", "children")],
+    Input("btn-connect-workspace", "n_clicks"),
+    [State("input-workspace-host", "value"),
+     State("input-workspace-token", "value")],
+    prevent_initial_call=True,
+)
+def on_connect_workspace(n_clicks, host, token):
+    if not _real_click():
+        return dash.no_update, dash.no_update, dash.no_update
+    res = db_adapter.connect_databricks_workspace(host=host, token=token)
+    if res.get("success"):
+        h_clean = (host or "").replace("https://", "").replace("http://", "").strip().rstrip("/")
+        auth_msg = f" ({res.get('auth_type', 'OAuth')} Active)"
+        alert = dbc.Alert([
+            html.I(className="bi bi-check-circle-fill me-1"),
+            res.get("message", "Connected successfully.")
+        ], color="success", className="py-1 mb-0 small")
+        return h_clean, auth_msg, alert
+    else:
+        alert = dbc.Alert([
+            html.I(className="bi bi-exclamation-triangle-fill me-1"),
+            res.get("message", "Connection failed.")
+        ], color="danger", className="py-1 mb-0 small")
+        return dash.no_update, dash.no_update, alert
+
+
+@app.callback(
+    [Output("select-existing-catalog", "options"),
+     Output("select-existing-catalog", "value"),
+     Output("select-existing-target-catalog", "options")],
+    [Input("modal-add-dataset", "is_open"),
+     Input("dataset-reg-method", "value"),
+     Input("btn-refresh-catalogs", "n_clicks")],
+    State("select-existing-catalog", "value"),
+    prevent_initial_call=True,
+)
+def load_catalogs(is_open, method, n_clicks, current_val):
+    if not is_open:
+        return dash.no_update, dash.no_update, dash.no_update
+    refresh = _safe_triggered_id() == "btn-refresh-catalogs"
+    catalogs = db_adapter.get_unity_catalogs(refresh=refresh)
+    opts = []
+    cat_names = []
+    for c in catalogs:
+        name = c["name"] if isinstance(c, dict) else str(c)
+        cat_names.append(name)
+        comment = f" - {c.get('comment')}" if isinstance(c, dict) and c.get('comment') else ""
+        opts.append({"label": f"{name}{comment}", "value": name})
+    val = current_val if current_val in cat_names else ("hospital_catalog" if "hospital_catalog" in cat_names else (cat_names[0] if cat_names else None))
+    return opts, val, opts
+
+
+@app.callback(
+    [Output("select-existing-schema", "options"),
+     Output("select-existing-schema", "value")],
+    [Input("select-existing-catalog", "value"),
+     Input("btn-refresh-schemas", "n_clicks")],
+    State("select-existing-schema", "value"),
+    prevent_initial_call=True,
+)
+def load_schemas(cat, n_clicks, current_val):
+    if not cat:
+        return [], None
+    refresh = _safe_triggered_id() == "btn-refresh-schemas"
+    schemas = db_adapter.get_unity_schemas(cat, refresh=refresh)
+    opts = []
+    sch_names = []
+    for s in schemas:
+        name = s["name"] if isinstance(s, dict) else str(s)
+        sch_names.append(name)
+        comment = f" - {s.get('comment')}" if isinstance(s, dict) and s.get('comment') else ""
+        opts.append({"label": f"{name}{comment}", "value": name})
+    val = current_val if current_val in sch_names else ("healthcare" if cat == "hospital_catalog" and "healthcare" in sch_names else (sch_names[0] if sch_names else None))
+    return opts, val
+
+
+@app.callback(
+    [Output("select-existing-table", "options"),
+     Output("select-existing-table", "value")],
+    [Input("select-existing-schema", "value"),
+     Input("select-existing-catalog", "value"),
+     Input("btn-refresh-tables", "n_clicks")],
+    State("select-existing-table", "value"),
+    prevent_initial_call=True,
+)
+def load_tables(sch, cat, n_clicks, current_val):
+    if not cat or not sch:
+        return [], None
+    refresh = _safe_triggered_id() == "btn-refresh-tables"
+    tables = db_adapter.get_unity_tables(cat, sch, refresh=refresh)
+    opts = []
+    tbl_names = []
+    for t in tables:
+        name = t["name"] if isinstance(t, dict) else str(t)
+        tbl_names.append(name)
+        tbl_type = f" ({t.get('type')})" if isinstance(t, dict) and t.get('type') else ""
+        opts.append({"label": f"{name}{tbl_type}", "value": name})
+    val = current_val if current_val in tbl_names else ("source_table" if cat == "hospital_catalog" and "source_table" in tbl_names else (tbl_names[0] if tbl_names else None))
+    return opts, val
+
+
+@app.callback(
+    [Output("select-existing-business-key", "options"),
+     Output("select-existing-business-key", "value"),
+     Output("input-existing-dataset-name", "value"),
+     Output("existing-table-preview-container", "children")],
+    [Input("select-existing-table", "value"),
+     Input("btn-refresh-existing-metadata", "n_clicks")],
+    [State("select-existing-catalog", "value"),
+     State("select-existing-schema", "value"),
+     State("input-existing-dataset-name", "value")],
+    prevent_initial_call=True,
+)
+def on_table_selected(tbl, n_clicks, cat, sch, current_ds_name):
+    if not cat or not sch or not tbl:
+        return [], None, dash.no_update, html.Div()
+    refresh = _safe_triggered_id() == "btn-refresh-existing-metadata"
+    meta = db_adapter.get_unity_table_metadata(cat, sch, tbl, refresh=refresh)
+    cols = meta.get("columns", [])
+    b_cand = meta.get("business_key_candidates", [])
+
+    schema_map = {s.get("column"): s.get("sql_type", "STRING") for s in meta.get("schema_info", [])}
+    col_opts = [{"label": f"{c} ({schema_map.get(c, 'STRING')})" + (" [Key Candidate]" if c in b_cand else ""), "value": c} for c in cols]
+    def_key = b_cand[0] if b_cand else (cols[0] if cols else None)
+
+    ds_name = tbl
+    preview_ui = _build_table_preview_card(meta)
+    return col_opts, def_key, ds_name, preview_ui
+
+
+@app.callback(
+    Output("collapse-existing-reconciliation", "is_open"),
+    Input("toggle-existing-reconciliation", "value"),
+    prevent_initial_call=True,
+)
+def toggle_reconciliation_section(enable_recon):
+    return bool(enable_recon)
+
+
+@app.callback(
+    [Output("select-existing-target-schema", "options"),
+     Output("select-existing-target-schema", "value")],
+    Input("select-existing-target-catalog", "value"),
+    prevent_initial_call=True,
+)
+def load_target_schemas(cat):
+    if not cat:
+        return [], None
+    schemas = db_adapter.get_unity_schemas(cat)
+    opts = []
+    sch_names = []
+    for s in schemas:
+        name = s["name"] if isinstance(s, dict) else str(s)
+        sch_names.append(name)
+        opts.append({"label": name, "value": name})
+    val = "healthcare" if cat == "hospital_catalog" and "healthcare" in sch_names else (sch_names[0] if sch_names else None)
+    return opts, val
+
+
+@app.callback(
+    [Output("select-existing-target-table", "options"),
+     Output("select-existing-target-table", "value")],
+    [Input("select-existing-target-schema", "value"),
+     Input("select-existing-target-catalog", "value")],
+    prevent_initial_call=True,
+)
+def load_target_tables(sch, cat):
+    if not cat or not sch:
+        return [], None
+    tables = db_adapter.get_unity_tables(cat, sch)
+    opts = []
+    tbl_names = []
+    for t in tables:
+        name = t["name"] if isinstance(t, dict) else str(t)
+        tbl_names.append(name)
+        tbl_type = f" ({t.get('type')})" if isinstance(t, dict) and t.get('type') else ""
+        opts.append({"label": f"{name}{tbl_type}", "value": name})
+    val = "patients_target" if cat == "hospital_catalog" and "patients_target" in tbl_names else (tbl_names[0] if tbl_names else None)
+    return opts, val
+
+
+@app.callback(
+    [Output("select-existing-target-bkey", "options"),
+     Output("select-existing-target-bkey", "value")],
+    [Input("select-existing-target-table", "value"),
+     Input("select-existing-target-schema", "value"),
+     Input("select-existing-target-catalog", "value")],
+    prevent_initial_call=True,
+)
+def load_target_bkeys(tbl, sch, cat):
+    if not cat or not sch or not tbl:
+        return [], None
+    meta = db_adapter.get_unity_table_metadata(cat, sch, tbl)
+    cols = meta.get("columns", [])
+    b_cand = meta.get("business_key_candidates", [])
+    schema_map = {s.get("column"): s.get("sql_type", "STRING") for s in meta.get("schema_info", [])}
+    opts = [{"label": f"{c} ({schema_map.get(c, 'STRING')})", "value": c} for c in cols]
+    val = b_cand[0] if b_cand else (cols[0] if cols else None)
+    return opts, val
+    if not cat or not sch or not tbl:
+        return [], None
+    meta = db_adapter.get_unity_table_metadata(cat, sch, tbl)
+    cols = meta.get("columns", [])
+    b_cand = meta.get("business_key_candidates", [])
+    schema_map = {s.get("column"): s.get("sql_type", "STRING") for s in meta.get("schema_info", [])}
+    opts = [{"label": f"{c} ({schema_map.get(c, 'STRING')})", "value": c} for c in cols]
+    val = b_cand[0] if b_cand else (cols[0] if cols else None)
+    return opts, val
+
+
+@app.callback(
+    Output("existing-connectivity-alert", "children"),
+    Input("btn-test-existing-conn", "n_clicks"),
+    [State("select-existing-catalog", "value"),
+     State("select-existing-schema", "value"),
+     State("select-existing-table", "value"),
+     State("select-existing-business-key", "value"),
+     State("toggle-existing-reconciliation", "value"),
+     State("select-existing-target-catalog", "value"),
+     State("select-existing-target-schema", "value"),
+     State("select-existing-target-table", "value"),
+     State("select-existing-target-bkey", "value")],
+    prevent_initial_call=True,
+)
+def on_test_existing_connectivity(n_clicks, cat, sch, tbl, b_key, enable_recon, tgt_cat, tgt_sch, tgt_tbl, tgt_bkey):
+    if not _real_click():
+        return dash.no_update
+    if not cat or not sch or not tbl:
+        return dbc.Alert("Please select Catalog, Schema, and Existing Table.", color="warning", className="small py-2 mb-0")
+
+    res = db_adapter.test_unity_catalog_connectivity(
+        catalog=cat,
+        schema=sch,
+        table=tbl,
+        business_key=b_key,
+        target_catalog=tgt_cat if enable_recon else None,
+        target_schema=tgt_sch if enable_recon else None,
+        target_table=tgt_tbl if enable_recon else None,
+        target_business_key=tgt_bkey if enable_recon else None,
+    )
+
+    checklist_items = []
+    for chk in res.get("checks", []):
+        icon = "bi-check-circle-fill text-success" if chk["status"] == "PASS" else "bi-x-circle-fill text-danger"
+        checklist_items.append(html.Div([
+            html.I(className=f"bi {icon} me-2"),
+            html.Span(f"{chk['name']}: ", className="fw-semibold small"),
+            html.Span(chk['message'], className="text-muted small"),
+        ], className="mb-1"))
+
+    alert_color = "success" if res.get("success") else "danger"
+    return dbc.Alert([
+        html.Div([
+            html.I(className=f"bi {'bi-check-circle-fill text-success' if res.get('success') else 'bi-exclamation-triangle-fill text-danger'} me-2 fs-5"),
+            html.Span(res.get("message", ""), className="fw-bold"),
+        ], className="d-flex align-items-center mb-2"),
+        html.Div(checklist_items, className="p-2 bg-white rounded border"),
+    ], color=alert_color, className="small py-2 mb-0")
+
+
+@app.callback(
+    [Output("dataset-registration-status-card", "children", allow_duplicate=True),
+     Output("dataset-registration-status-card", "style", allow_duplicate=True),
+     Output("dataset-registration-form-container", "style", allow_duplicate=True),
+     Output("upload-submit-alert", "children"),
+     Output("existing-submit-alert", "children"),
+     Output("global-toast", "is_open", allow_duplicate=True),
+     Output("global-toast", "children", allow_duplicate=True),
+     Output("global-toast", "icon", allow_duplicate=True),
+     Output("project-refresh-store", "data", allow_duplicate=True)],
+    [Input("btn-submit-upload-dataset", "n_clicks"),
+     Input("btn-submit-existing-dataset", "n_clicks")],
+    [State("select-dataset-target-project", "value"),
+     State("dataset-reg-method", "value"),
+     # Upload states
+     State("upload-file-store", "data"),
+     State("input-upload-dataset-name", "value"),
+     State("input-upload-catalog", "value"),
+     State("input-upload-schema", "value"),
+     State("input-upload-table-name", "value"),
+     State("select-upload-business-key", "value"),
+     State("input-upload-target-table", "value"),
+     State("input-upload-description", "value"),
+     # Existing states
+     State("input-existing-dataset-name", "value"),
+     State("select-existing-catalog", "value"),
+     State("select-existing-schema", "value"),
+     State("select-existing-table", "value"),
+     State("select-existing-business-key", "value"),
+     State("toggle-existing-reconciliation", "value"),
+     State("select-existing-target-catalog", "value"),
+     State("select-existing-target-schema", "value"),
+     State("select-existing-target-table", "value"),
+     State("select-existing-target-bkey", "value"),
+     State("input-existing-description", "value")],
+    prevent_initial_call=True,
+)
+def handle_submit_dataset(
+    upload_click, existing_click,
+    project_id, reg_method,
+    file_store, up_ds_name, up_cat, up_sch, up_tbl, up_b_key, up_tgt, up_desc,
+    ex_ds_name, ex_cat, ex_sch, ex_tbl, ex_b_key, enable_recon, ex_tgt_cat, ex_tgt_sch, ex_tgt_tbl, ex_tgt_bkey, ex_desc
+):
+    trig = _safe_triggered_id()
+    if not trig or not _real_click():
+        return (dash.no_update,) * 9
+
+    _ts = datetime.now().isoformat()
+    if not project_id:
+        err = dbc.Alert("Target Project is required. Please select or create a project.", color="danger", className="py-2 mb-0")
+        return dash.no_update, dash.no_update, dash.no_update, err, err, False, "", "info", dash.no_update
+
+    p_id = int(project_id)
+    p_df = db_adapter.query_df("SELECT project_name FROM dq_project_config WHERE project_id = ?", (p_id,))
+    p_name = p_df.iloc[0]["project_name"] if not p_df.empty else f"Project #{p_id}"
+
+    # OPTION 1: Upload Dataset Submit
+    if trig == "btn-submit-upload-dataset":
+        if not file_store or not file_store.get("contents"):
+            err = dbc.Alert("Please upload a file (CSV, JSON, Parquet, or Excel) before registering.", color="warning", className="py-2 mb-0")
+            return dash.no_update, dash.no_update, dash.no_update, err, dash.no_update, False, "", "info", dash.no_update
+
+        if not up_ds_name or not up_tbl:
+            err = dbc.Alert("Dataset Name and Destination Table Name are required.", color="danger", className="py-2 mb-0")
+            return dash.no_update, dash.no_update, dash.no_update, err, dash.no_update, False, "", "info", dash.no_update
+
+        res = db_adapter.register_uploaded_dataset(
+            project_id=p_id,
+            dataset_name=up_ds_name.strip(),
+            contents=file_store["contents"],
+            filename=file_store["filename"],
+            catalog=(up_cat or "hospital_catalog").strip(),
+            schema=(up_sch or "healthcare").strip(),
+            table_name=up_tbl.strip(),
+            business_key=(up_b_key or "").strip(),
+            target_table=(up_tgt or "").strip() or None,
+            description=(up_desc or "").strip(),
+            user="admin"
+        )
+
+        if not res.get("success"):
+            err = dbc.Alert([
+                html.I(className="bi bi-exclamation-triangle-fill me-2"),
+                res.get("message")
+            ], color="danger", className="py-2 mb-0")
+            return dash.no_update, dash.no_update, dash.no_update, err, dash.no_update, False, "", "info", dash.no_update
+
+        # Build Post-Registration Details Card
+        status_card = _build_registration_success_card(
+            dataset_name=res["dataset_name"],
+            project_name=p_name,
+            full_table=res["full_table_name"],
+            record_count=res["total_records"],
+            columns=res["columns"],
+            schema_info=res.get("schema_info", []),
+            business_key=res.get("business_key", ""),
+            method="Uploaded File (Delta Table Created)",
+            target_table=res.get("target_table_name"),
+            registered_at=res.get("registered_at"),
+            connection_status=res.get("connection_status", "Active (Local Unity Catalog)")
+        )
+        return status_card, {"display": "block"}, {"display": "none"}, None, None, True, f"Dataset '{up_ds_name}' registered successfully!", "success", _ts
+
+    # OPTION 2: Existing Table Submit
+    if trig == "btn-submit-existing-dataset":
+        if not ex_ds_name or not ex_cat or not ex_sch or not ex_tbl:
+            err = dbc.Alert("Dataset Name, Catalog, Schema, and Existing Table Name are required.", color="danger", className="py-2 mb-0")
+            return dash.no_update, dash.no_update, dash.no_update, dash.no_update, err, False, "", "info", dash.no_update
+
+        target_table = None
+        if enable_recon and ex_tgt_tbl:
+            t_cat = (ex_tgt_cat or ex_cat).strip()
+            t_sch = (ex_tgt_sch or ex_sch).strip()
+            target_table = f"{t_cat}.{t_sch}.{ex_tgt_tbl.strip()}"
+
+        res = db_adapter.register_existing_table(
+            project_id=p_id,
+            dataset_name=ex_ds_name.strip(),
+            catalog=ex_cat.strip(),
+            schema=ex_sch.strip(),
+            table_name=ex_tbl.strip(),
+            business_key=(ex_b_key or "id").strip(),
+            target_table=target_table,
+            description=(ex_desc or "").strip(),
+            user="admin"
+        )
+
+        if not res.get("success"):
+            err = dbc.Alert([
+                html.I(className="bi bi-exclamation-triangle-fill me-2"),
+                res.get("message")
+            ], color="danger", className="py-2 mb-0")
+            return dash.no_update, dash.no_update, dash.no_update, dash.no_update, err, False, "", "info", dash.no_update
+
+        status_card = _build_registration_success_card(
+            dataset_name=res["dataset_name"],
+            project_name=p_name,
+            full_table=res["full_table_name"],
+            record_count=res.get("total_records", 0),
+            columns=res.get("columns", []),
+            schema_info=res.get("schema_info", []),
+            business_key=res.get("business_key", ""),
+            method="Existing Unity Catalog Table",
+            target_table=res.get("target_table_name"),
+            registered_at=res.get("registered_at"),
+            connection_status=res.get("connection_status", "Connected (Unity Catalog)")
+        )
+        return status_card, {"display": "block"}, {"display": "none"}, None, None, True, f"Dataset '{ex_ds_name}' registered successfully!", "success", _ts
+
+    return (dash.no_update,) * 9
+
+
+def _build_registration_success_card(
+    dataset_name, project_name, full_table, record_count, columns, schema_info, business_key, method,
+    target_table=None, registered_at=None, connection_status=None
+):
+    """Builds the comprehensive post-registration confirmation card."""
+    if not registered_at:
+        registered_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not connection_status:
+        connection_status = "Connected (Databricks Unity Catalog)"
+
+    col_pills = [
+        html.Span([
+            html.Span(c, className="fw-semibold me-1"),
+            html.Span(next((s.get("sql_type", "TEXT") for s in schema_info if s.get("column") == c), "TEXT"),
+                      className="badge bg-light text-primary border small"),
+        ], className="badge bg-white text-dark border me-2 mb-2 p-2")
+        for c in columns
+    ]
+
+    return html.Div([
+        # Success Header
+        html.Div([
+            html.I(className="bi bi-check-circle-fill text-success fs-1 mb-2"),
+            html.H4("Dataset Successfully Registered!", className="fw-bold text-dark mb-1"),
+            html.P(f"Dataset '{dataset_name}' is now registered under '{project_name}' in Unity Catalog and ready for automated quality validations.",
+                   className="text-muted"),
+            html.Div([
+                html.Span([
+                    html.I(className="bi bi-hdd-network-fill text-success me-1"),
+                    f"Status: {connection_status}"
+                ], className="badge bg-success-subtle text-success border border-success me-2 px-3 py-1"),
+                html.Span([
+                    html.I(className="bi bi-clock-history me-1"),
+                    f"Registered: {registered_at}"
+                ], className="badge bg-light text-muted border px-3 py-1"),
+            ], className="mt-2"),
+        ], className="text-center py-3"),
+
+        # Summary KPIs Grid
+        dbc.Row([
+            dbc.Col([
+                html.Div([
+                    html.Div("Target Project", className="small text-muted fw-semibold"),
+                    html.Div(project_name, className="fs-6 fw-bold text-dark text-truncate"),
+                ], className="p-3 bg-light rounded border text-center h-100"),
+            ], md=4, className="mb-3"),
+            dbc.Col([
+                html.Div([
+                    html.Div("Dataset Name", className="small text-muted fw-semibold"),
+                    html.Div(dataset_name, className="fs-6 fw-bold text-primary text-truncate"),
+                ], className="p-3 bg-light rounded border text-center h-100"),
+            ], md=4, className="mb-3"),
+            dbc.Col([
+                html.Div([
+                    html.Div("Business Key", className="small text-muted fw-semibold"),
+                    html.Div(business_key or "id", className="fs-6 fw-bold text-secondary text-truncate"),
+                ], className="p-3 bg-light rounded border text-center h-100"),
+            ], md=4, className="mb-3"),
+        ], className="mb-2"),
+
+        dbc.Row([
+            dbc.Col([
+                html.Div([
+                    html.Div("Source Table (Unity Catalog)", className="small text-muted fw-semibold"),
+                    html.Div(full_table, className="fs-6 fw-bold text-dark text-truncate"),
+                ], className="p-3 bg-light rounded border text-center h-100"),
+            ], md=4, className="mb-3"),
+            dbc.Col([
+                html.Div([
+                    html.Div("Target Table (Reconciliation)", className="small text-muted fw-semibold"),
+                    html.Div(target_table or "N/A (Single Table)", className="fs-6 fw-bold text-dark text-truncate"),
+                ], className="p-3 bg-light rounded border text-center h-100"),
+            ], md=4, className="mb-3"),
+            dbc.Col([
+                html.Div([
+                    html.Div("Record Count & Columns", className="small text-muted fw-semibold"),
+                    html.Div(f"{record_count:,} rows | {len(columns)} cols", className="fs-6 fw-bold text-success"),
+                ], className="p-3 bg-light rounded border text-center h-100"),
+            ], md=4, className="mb-3"),
+        ], className="mb-3"),
+
+        # Schema & Columns Grid
+        html.Div([
+            html.Div([
+                html.Span("Registered Columns & Data Types", className="fw-bold text-dark me-2"),
+                html.Span(f"({len(columns)} columns)", className="badge bg-secondary-subtle text-secondary small"),
+            ], className="mb-2"),
+            html.Div(col_pills, className="d-flex flex-wrap p-3 bg-light rounded border mb-4"),
+        ]),
+
+        # Next Steps Action Strip
+        html.Div([
+            html.Div([
+                html.Span("Next Step: ", className="fw-bold text-secondary me-2"),
+                html.Span("Configure Quality Rules to establish automated baseline validations for this dataset.", className="text-muted small"),
+            ], className="mb-3"),
+            html.Div([
+                dbc.Button([
+                    html.I(className="bi bi-shield-check me-2"),
+                    "Configure Data Quality Rules"
+                ], href="/rules", color="success", className="rounded-pill px-4 py-2 fw-semibold me-3 shadow-sm"),
+                dbc.Button([
+                    html.I(className="bi bi-play-circle-fill me-2"),
+                    "Run Execution"
+                ], href="/execution", color="primary", className="rounded-pill px-3 py-2 fw-semibold me-3"),
+                dbc.Button([
+                    html.I(className="bi bi-arrow-left-right me-2"),
+                    "Source-Target Reconciliation"
+                ], href="/reconciliation", color="outline-primary", className="rounded-pill px-3 py-2 fw-semibold me-3"),
+            ], className="d-flex align-items-center justify-content-end"),
+        ], className="p-3 bg-white rounded border"),
+    ], className="p-2")
+
+
+
+# =============================================================================
+# OVERVIEW CALLBACKS — refresh KPIs, trend, recent executions every 30s
+# =============================================================================
+
+@app.callback(
+    [Output("overview-filter-dataset", "options"),
+     Output("overview-filter-dataset", "value")],
+    Input("overview-filter-project", "value"),
+    prevent_initial_call=True,
+)
+def overview_dataset_options(proj):
+    ds = db_adapter.get_datasets_for_project(proj, include_inactive=True) if proj and proj != "All" else []
+    return [{"label": "Dataset: All", "value": "All"}] + [{"label": d, "value": d} for d in ds], "All"
+
+
+@app.callback(
+    [Output("overview-kpi-row",             "children"),
+     Output("overview-trend-chart",         "figure"),
+     Output("overview-donut-chart",         "figure"),
+     Output("overview-project-score-chart", "figure"),
+     Output("overview-recent-exec-body",    "children"),
+     Output("overview-critical-failures",   "children"),
+     Output("overview-last-updated",        "children")],
+    [Input("overview-interval", "n_intervals"),
+     Input("btn-overview-refresh", "n_clicks"),
+     Input("overview-filter-project", "value"),
+     Input("overview-filter-dataset", "value")],
+    prevent_initial_call=True,
+)
+def refresh_overview(n_intervals, refresh_clicks, proj, ds):
+    return _overview_figures(proj, ds)
+
+
+
+
+# =============================================================================
+# EXECUTION & MONITORING CALLBACKS
+# =============================================================================
+
+# Helper: Render Execution Details Modal Content
+def _render_execution_details_modal_content(execution_id: str):
+    det = db_adapter.get_execution_details(execution_id)
+    if not det or not det.get("summary"):
+        return html.Div(f"No execution details found for {execution_id}.", className="text-muted p-3")
+
+    s = det["summary"]
+    prog = det.get("progress", [])
+    c_stats = det.get("concurrency_stats", {})
+    alerts = det.get("alerts", [])
+    emails = det.get("emails", [])
+
+    st = str(s.get("overall_status") or "UNKNOWN")
+    badge_cls = "badge-pass" if st == "PASS" else ("badge-fail" if st == "FAIL" else "badge-error")
+
+    metrics_row = dbc.Row([
+        dbc.Col([html.Div("Execution ID", className="small text-muted"), html.B(execution_id, style={"fontFamily": "monospace"})], md=3),
+        dbc.Col([html.Div("Target", className="small text-muted"), html.B(f"{s.get('project_name')} / {s.get('dataset_name')}")], md=3),
+        dbc.Col([html.Div("Overall Status", className="small text-muted"), html.Span(st, className=badge_cls)], md=2),
+        dbc.Col([html.Div("DQ Score", className="small text-muted"), html.B(f"{s.get('dq_score', 0)}%", className="text-primary fs-5")], md=2),
+        dbc.Col([html.Div("Duration", className="small text-muted"), html.B(f"{s.get('duration_ms', 0)} ms")], md=2),
+    ], className="p-3 bg-light rounded mb-3")
+
+    th_dist = c_stats.get("thread_distribution", {})
+    th_badges = [html.Span(f"{th}: {cnt} rule(s)", className="badge bg-secondary text-white me-2 small") for th, cnt in th_dist.items()]
+    concurrency_strip = html.Div([
+        html.Div([
+            html.I(className="bi bi-cpu text-primary me-2"),
+            html.B("Parallel Concurrency Metrics: "),
+            html.Span(f"Max Workers: {c_stats.get('max_workers', 4)} | Thread Distribution: "),
+            *th_badges
+        ], className="small text-muted mb-3 p-2 border rounded bg-white")
+    ])
+
+    rule_rows = []
+    for p in prog:
+        p_st = str(p.get("status") or "—")
+        p_badge = "badge-pass" if p_st == "PASS" else ("badge-fail" if p_st == "FAIL" else "badge-error")
+        rule_rows.append(html.Tr([
+            html.Td(html.B(str(p.get("rule_name"))), className="small"),
+            html.Td(str(p.get("column_name") or "—"), className="small"),
+            html.Td(str(p.get("threshold") or "0"), className="small text-muted"),
+            html.Td(html.Span(p_st, className=p_badge)),
+            html.Td(str(p.get("observed_value") or "—"), className="small"),
+            html.Td(str(p.get("expected_value") or "—"), className="small"),
+            html.Td(str(p.get("failure_count") or 0), className="small fw-semibold text-danger" if p_st == "FAIL" else "small"),
+            html.Td(f"{p.get('duration_ms', 0)} ms", className="small"),
+            html.Td(html.Span(str(p.get("worker_thread") or "Main"), className="badge bg-light text-dark border small")),
+            html.Td(str(p.get("error_message") or "—"), className="small text-muted"),
+        ]))
+
+    rules_table = html.Div([
+        html.H6([html.I(className="bi bi-list-check me-2"), "Rule Execution Breakdown"], className="fw-bold mb-2"),
+        html.Table([
+            html.Thead(html.Tr([
+                html.Th("Rule Name"), html.Th("Column"), html.Th("Threshold"), html.Th("Status"),
+                html.Th("Observed"), html.Th("Expected"), html.Th("Failures"),
+                html.Th("Duration"), html.Th("Worker Thread"), html.Th("Notes / Error"),
+            ]), className="table-header"),
+            html.Tbody(rule_rows if rule_rows else [html.Tr([html.Td("No rule details recorded.", colSpan=10, className="text-center text-muted")])]),
+        ], className="dq-table w-100"),
+    ], style={"overflowX": "auto"}, className="mb-3")
+
+    alerts_section = None
+    if alerts:
+        alert_items = [html.Div(f"[{a.get('severity')}] {a.get('rule_name')}: {a.get('message')}", className="small text-danger mb-1") for a in alerts]
+        alerts_section = html.Div([
+            html.H6([html.I(className="bi bi-bell-fill text-danger me-2"), f"Linked Alerts ({len(alerts)})"], className="fw-bold mb-1"),
+            html.Div(alert_items, className="p-2 border rounded bg-light mb-3"),
+        ])
+
+    return html.Div([metrics_row, concurrency_strip, rules_table, alerts_section])
+
+
+# Callback E0: Mode toggle (Manual vs Scheduled)
+@app.callback(
+    [Output("exec-manual-container", "style"),
+     Output("exec-schedule-container", "style")],
+    Input("exec-mode-toggle", "value"),
+)
+def exec_mode_toggle_callback(mode):
+    if mode == "SCHEDULED":
+        return {"display": "none"}, {"display": "block"}
+    return {"display": "block"}, {"display": "none"}
+
+
+# Callback E0.1: Rules mode toggle (All vs Selected)
+@app.callback(
+    [Output("exec-rules-checklist-container", "style"),
+     Output("exec-rule-selection-tools", "style")],
+    Input("exec-rules-mode", "value"),
+)
+def exec_rules_mode_callback(mode):
+    if mode == "SELECTED":
+        return {"display": "block"}, {"display": "block"}
+    return {"display": "none"}, {"display": "none"}
+
+
+# Callback E1: Project → populate dataset dropdown
+@app.callback(
+    [Output("exec-select-dataset", "options"),
+     Output("exec-select-dataset", "value")],
+    Input("exec-select-project", "value"),
+    prevent_initial_call=False,
+)
+def exec_update_dataset_dropdown(selected_project):
+    if not selected_project:
+        return [], None
+    datasets = db_adapter.get_datasets_for_project(selected_project)
+    options = [{"label": d, "value": d} for d in datasets]
+    value = datasets[0] if datasets else None
+    return options, value
+
+
+# Callback E1.1: Project/Dataset → populate rules checklist & active rules summary
+@app.callback(
+    [Output("exec-rules-checklist", "options"),
+     Output("exec-rules-checklist", "value"),
+     Output("exec-active-rules-summary", "children")],
+    [Input("exec-select-project", "value"),
+     Input("exec-select-dataset", "value")],
+)
+def exec_update_rules_checklist_and_summary(proj, ds):
+    if not proj or not ds:
+        return [], [], ""
+    options = _render_rules_checklist(proj, ds)
+    vals = [opt["value"] for opt in options]
+    summary_txt = f"Active Rules Configured: {len(options)} rule(s) for {proj} / {ds}"
+    return options, vals, summary_txt
+
+
+# Callback E1.2: Select All / Deselect All rules checklist
+@app.callback(
+    Output("exec-rules-checklist", "value", allow_duplicate=True),
+    [Input("btn-rules-select-all", "n_clicks"),
+     Input("btn-rules-deselect-all", "n_clicks")],
+    State("exec-rules-checklist", "options"),
+    prevent_initial_call=True,
+)
+def handle_select_deselect_rules(all_clicks, none_clicks, options):
+    if not _real_click():
+        return dash.no_update
+    trig = ctx.triggered_id
+    if trig == "btn-rules-select-all":
+        return [opt["value"] for opt in (options or [])]
+    return []
+
+
+# Callback E1.3: Frequency selection conditional inputs
+@app.callback(
+    [Output("sched-row-weekdays", "style"),
+     Output("sched-row-cron", "style"),
+     Output("sched-col-interval", "style")],
+    Input("sched-select-frequency", "value"),
+)
+def handle_sched_freq_inputs(freq):
+    freq_u = (freq or "DAILY").upper()
+    weekdays_style = {"display": "block"} if freq_u == "WEEKLY" else {"display": "none"}
+    cron_style = {"display": "block"} if freq_u == "CUSTOM" else {"display": "none"}
+    interval_style = {"display": "none"} if freq_u in ("CUSTOM", "ONCE") else {"display": "block"}
+    return weekdays_style, cron_style, interval_style
+
+
+# Callback E1.4: Save Schedule
+@app.callback(
+    [Output("sched-feedback-msg", "children"),
+     Output("sched-table-body", "children", allow_duplicate=True)],
+    Input("btn-save-schedule", "n_clicks"),
+    [State("sched-input-name", "value"),
+     State("exec-select-project", "value"),
+     State("exec-select-dataset", "value"),
+     State("sched-select-frequency", "value"),
+     State("sched-select-timezone", "value"),
+     State("sched-input-start-date", "value"),
+     State("sched-input-start-time", "value"),
+     State("sched-input-interval", "value"),
+     State("sched-input-weekdays", "value"),
+     State("sched-input-cron", "value"),
+     State("sched-input-end-date", "value"),
+     State("sched-select-concurrency", "value"),
+     State("exec-rules-mode", "value"),
+     State("exec-rules-checklist", "value")],
+    prevent_initial_call=True,
+)
+def handle_save_schedule(n_clicks, s_name, proj, ds, freq, tz, s_date, s_time,
+                         rep_int, weekdays, cron_expr, e_date, concurrency,
+                         rules_mode, selected_rules):
+    if not _real_click() or not proj or not ds:
+        return dash.no_update, dash.no_update
+
+    try:
+        w_days_str = ",".join(weekdays) if weekdays else None
+        sched_data = {
+            "schedule_name": s_name or f"{proj}_{ds}_{freq}_DQ",
+            "project_name": proj,
+            "dataset_name": ds,
+            "frequency": freq or "DAILY",
+            "timezone": tz or "UTC",
+            "start_date": s_date or datetime.today().strftime("%Y-%m-%d"),
+            "start_time": s_time or "08:00",
+            "repeat_interval": int(rep_int or 1),
+            "weekdays": w_days_str,
+            "cron_expression": cron_expr,
+            "end_date": e_date,
+            "concurrency_policy": concurrency or "SKIP",
+            "rules_mode": rules_mode or "ALL",
+            "selected_rules": selected_rules if rules_mode == "SELECTED" else None,
+        }
+        new_id = db_adapter.save_schedule(sched_data, user="admin")
+        msg = html.Div([
+            html.I(className="bi bi-check-circle-fill text-success me-2"),
+            html.Span(f"Schedule '{sched_data['schedule_name']}' created successfully (ID: {new_id}).", className="text-success fw-bold"),
+        ], className="p-2 rounded bg-success-subtle")
+        table_rows = _render_schedules_table(project_name=proj, dataset_name=ds)
+        return msg, table_rows
+    except Exception as ex:
+        err_msg = html.Div([
+            html.I(className="bi bi-exclamation-triangle-fill text-danger me-2"),
+            html.Span(f"Error saving schedule: {ex}", className="text-danger fw-bold"),
+        ], className="p-2 rounded bg-danger-subtle")
+        return err_msg, dash.no_update
+
+
+# Callback E1.5: Schedules table filter and row actions (Run Now, Pause/Resume, Delete)
+@app.callback(
+    [Output("sched-table-body", "children"),
+     Output("exec-store", "data", allow_duplicate=True),
+     Output("exec-interval", "disabled", allow_duplicate=True),
+     Output("btn-trigger-validation", "disabled", allow_duplicate=True),
+     Output("btn-cancel-execution", "disabled", allow_duplicate=True)],
+    [Input("btn-refresh-schedules", "n_clicks"),
+     Input("sched-filter-status", "value"),
+     Input("exec-select-project", "value"),
+     Input({"type": "btn-sched-run-now", "id": dash.ALL}, "n_clicks"),
+     Input({"type": "btn-sched-toggle-status", "id": dash.ALL, "status": dash.ALL}, "n_clicks"),
+     Input({"type": "btn-sched-delete", "id": dash.ALL}, "n_clicks")],
+    prevent_initial_call="initial_duplicate",
+)
+def handle_schedules_table_actions(refresh_clicks, st_filter, proj, run_clicks, toggle_clicks, delete_clicks):
+    trig = ctx.triggered_id
+    if isinstance(trig, dict) and _real_click():
+        action_type = trig.get("type")
+        sid = int(trig.get("id"))
+        if action_type == "btn-sched-run-now":
+            res = db_adapter.run_schedule_now(sid, user="admin")
+            exec_id = res.get("execution_id")
+            new_store = {
+                "execution_id": exec_id,
+                "project": proj,
+                "dataset": res.get("dataset_name"),
+                "start_time": res.get("start_time"),
+                "_started_ts": time.time()
+            }
+            rows = _render_schedules_table(project_name=proj, status=st_filter)
+            return rows, new_store, False, True, False
+        elif action_type == "btn-sched-toggle-status":
+            current_st = trig.get("status")
+            if current_st == "ACTIVE":
+                db_adapter.pause_schedule(sid, user="admin")
+            else:
+                db_adapter.resume_schedule(sid, user="admin")
+        elif action_type == "btn-sched-delete":
+            db_adapter.delete_schedule(sid, user="admin")
+
+    rows = _render_schedules_table(project_name=proj, status=st_filter)
+    return rows, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+
+# Callback E2: Run Validation button → concurrent parallel execution
+@app.callback(
+    [Output("exec-store", "data"),
+     Output("exec-meta-id", "children"),
      Output("exec-meta-start", "children"),
-     Output("exec-meta-duration", "children"),
+     Output("exec-interval", "disabled"),
+     Output("btn-trigger-validation", "disabled"),
+     Output("btn-cancel-execution", "disabled"),
+     Output("exec-live-progress-list", "children"),
      Output("exec-count-pass", "children"),
      Output("exec-count-fail", "children"),
      Output("exec-count-error", "children"),
-     Output("exec-live-progress-list", "children")],
+     Output("exec-dq-score", "children"),
+     Output("exec-stepper-container", "children"),
+     Output("exec-meta-duration", "children")],
     Input("btn-trigger-validation", "n_clicks"),
     [State("exec-select-project", "value"),
-     State("exec-select-dataset", "value")],
+     State("exec-select-dataset", "value"),
+     State("exec-rules-mode", "value"),
+     State("exec-rules-checklist", "value")],
     prevent_initial_call=True,
 )
-def handle_run_validation(n_clicks, proj, ds):
-    res = db_adapter.trigger_validation(proj or "Hospital", ds or "source_table")
-    
-    rule_results = res.get("rule_results", [])
+def handle_run_validation(n_clicks, proj, ds, rules_mode, selected_rules):
+    if not proj or not ds or not _real_click():
+        return (dash.no_update,) * 13
+
+    rule_ids_param = selected_rules if rules_mode == "SELECTED" else None
+    res = db_adapter.trigger_validation(proj, ds, run_type="MANUAL", rule_ids=rule_ids_param)
+    exec_id = res["execution_id"]
+    start_time = res["start_time"]
+
+    store = {"execution_id": exec_id, "project": proj, "dataset": ds,
+             "start_time": start_time, "_started_ts": time.time()}
+
+    live_items = [
+        html.Div([
+            html.I(className="bi bi-arrow-repeat text-primary me-2"),
+            html.Span(f"Executing {res['total_rules']} rules concurrently across 4 worker threads…", className="fw-semibold"),
+        ], className="mb-2 p-2 rounded", style={"backgroundColor": "#EFF6FF"}),
+    ]
+
+    stepper = _render_stepper("RUNNING", 0, res.get("total_rules", 0))
+
+    return (
+        store,          # exec-store
+        exec_id,        # exec-meta-id
+        start_time,     # exec-meta-start
+        False,          # enable interval
+        True,           # disable run button
+        False,          # enable cancel button
+        live_items,     # live progress list
+        "…",            # pass count
+        "…",            # fail count
+        "…",            # error count
+        "…",            # dq score
+        stepper,        # stepper
+        "Running…",     # duration
+    )
+
+
+# Callback E2.1: Cancel Execution
+@app.callback(
+    [Output("btn-cancel-execution", "disabled", allow_duplicate=True),
+     Output("exec-live-progress-list", "children", allow_duplicate=True)],
+    Input("btn-cancel-execution", "n_clicks"),
+    State("exec-store", "data"),
+    prevent_initial_call=True,
+)
+def handle_cancel_execution(clicks, store):
+    if not _real_click() or not store or not store.get("execution_id"):
+        return dash.no_update, dash.no_update
+    exec_id = store["execution_id"]
+    db_adapter.cancel_execution(exec_id, user="admin")
+    cancelled_msg = html.Div([
+        html.I(className="bi bi-x-octagon-fill text-danger me-2"),
+        html.Span(f"Execution {exec_id} cancellation requested.", className="fw-bold text-danger"),
+    ], className="p-2 rounded bg-danger-subtle")
+    return True, [cancelled_msg]
+
+
+# Callback E3: Polling interval → update progress + summary from DB
+@app.callback(
+    [Output("exec-stepper-container", "children", allow_duplicate=True),
+     Output("exec-count-pass", "children", allow_duplicate=True),
+     Output("exec-count-fail", "children", allow_duplicate=True),
+     Output("exec-count-error", "children", allow_duplicate=True),
+     Output("exec-dq-score", "children", allow_duplicate=True),
+     Output("exec-live-progress-list", "children", allow_duplicate=True),
+     Output("exec-meta-duration", "children", allow_duplicate=True),
+     Output("exec-interval", "disabled", allow_duplicate=True),
+     Output("btn-trigger-validation", "disabled", allow_duplicate=True),
+     Output("btn-cancel-execution", "disabled", allow_duplicate=True),
+     Output("exec-history-table-body", "children", allow_duplicate=True),
+     Output("exec-store", "data", allow_duplicate=True)],
+    Input("exec-interval", "n_intervals"),
+    State("exec-store", "data"),
+    prevent_initial_call=True,
+)
+def poll_execution_progress(n_intervals, store):
+    if not store or not store.get("execution_id"):
+        return (dash.no_update,) * 12
+
+    started_ts = store.get("_started_ts", 0)
+    if started_ts and (time.time() - started_ts > 180):
+        return (
+            dash.no_update, dash.no_update, dash.no_update, dash.no_update,
+            dash.no_update, dash.no_update, dash.no_update,
+            True,   # disable interval
+            False,  # re-enable run button
+            True,   # disable cancel button
+            dash.no_update,
+            dash.no_update,
+        )
+
+    exec_id = store["execution_id"]
+    proj    = store.get("project")
+    ds      = store.get("dataset")
+
+    # Fetch DB state
+    summary   = db_adapter.get_execution_status(exec_id)
+    dq_status = summary.get("dq_status", "RUNNING")
+    progress  = db_adapter.get_execution_progress(exec_id)
+    rules_done  = sum(1 for p in progress if p["status"] not in ("QUEUED", "RUNNING"))
+    rules_total = len(progress)
+
+    _finalizing = store.get("_finalizing", False)
+    if dq_status == "RUNNING":
+        stepper_status = "RUNNING"
+    elif dq_status in ("PASS", "FAIL", "ERROR", "COMPLETED", "CANCELLED"):
+        if not _finalizing:
+            stepper_status = "FINALIZING"
+        else:
+            stepper_status = dq_status
+    else:
+        stepper_status = dq_status
+
+    stepper = _render_stepper(stepper_status, rules_done, rules_total)
+
+    # Build live progress items with worker thread attribution
     live_items = []
-    for r in rule_results:
-        s = r.get("status", "PASS")
-        r_name = r.get("name", "RULE")
+    for p in progress:
+        s = p["status"]
         if s == "PASS":
             icon_cls = "bi bi-check-circle-fill text-success me-2"
             bg = "#F0FDF4"
         elif s == "FAIL":
             icon_cls = "bi bi-x-circle-fill text-danger me-2"
             bg = "#FEF2F2"
-        else:
+        elif s == "ERROR":
             icon_cls = "bi bi-exclamation-triangle-fill text-warning me-2"
             bg = "#FFFBEB"
+        elif s == "CANCELLED":
+            icon_cls = "bi bi-x-octagon-fill text-secondary me-2"
+            bg = "#F1F5F9"
+        else:
+            icon_cls = "bi bi-arrow-repeat text-primary me-2"
+            bg = "#EFF6FF"
+
+        label = f"{p['rule_name']} — {s}"
+        if s == "FAIL" and p.get("failure_count", 0) > 0:
+            label += f" ({p['failure_count']} defects)"
+        
+        worker_txt = str(p.get("worker_thread") or "Worker")
+        dur_txt = f"{p.get('duration_ms', 0)}ms" if p.get('duration_ms') else ""
+
         live_items.append(html.Div([
-            html.I(className=icon_cls),
-            html.Span(f"{r_name} - {s}", className="fw-semibold"),
-        ], className="mb-2 p-2 rounded", style={"backgroundColor": bg}))
-    
+            html.Div([
+                html.I(className=icon_cls),
+                html.Span(label, className="fw-semibold small"),
+            ]),
+            html.Div([
+                html.Span(dur_txt, className="text-muted small me-2") if dur_txt else None,
+                html.Span(worker_txt, className="badge bg-light text-secondary border small"),
+            ]),
+        ], className="mb-2 p-2 rounded d-flex justify-content-between align-items-center", style={"backgroundColor": bg}))
+
     if not live_items:
-        live_items = [html.Div("No rule evaluations recorded.", className="text-muted p-2")]
-    
+        live_items = [html.Div("Initializing rules...", className="text-muted p-2")]
+
+    dur_str = summary.get("duration", "Running…")
+    passed  = summary.get("passed",  0)
+    failed  = summary.get("failed",  0)
+    errored = summary.get("errored", 0)
+    score   = summary.get("dq_score", 0.0)
+    total_r = summary.get("total_rules", 0)
+
+    if dq_status == "RUNNING":
+        pass_disp  = str(passed)  if passed  > 0 else "…"
+        fail_disp  = str(failed)  if failed  > 0 else "…"
+        error_disp = str(errored) if errored > 0 else "…"
+        score_disp = "…"
+    else:
+        pass_disp  = str(passed)
+        fail_disp  = str(failed)
+        error_disp = str(errored)
+        score_disp = f"{score:.1f}%" if total_r > 0 else "N/A"
+
+    is_db_done = dq_status not in ("RUNNING", "QUEUED", "UNKNOWN")
+
+    if is_db_done and not _finalizing:
+        interval_off = False
+        btn_disabled = True
+        btn_cancel_off = True
+        hist_rows = dash.no_update
+        updated_store = dict(store)
+        updated_store["_finalizing"] = True
+    elif is_db_done and _finalizing:
+        interval_off  = True
+        btn_disabled  = False
+        btn_cancel_off = True
+        try:
+            hist_rows = _render_history_table(project_name=proj, dataset_name=ds)
+        except Exception as e:
+            logger.error(f"Error rendering history table: {e}")
+            hist_rows = dash.no_update
+        updated_store = dict(store)
+    else:
+        interval_off  = False
+        btn_disabled  = True
+        btn_cancel_off = False
+        hist_rows     = dash.no_update
+        updated_store = dict(store)
+
     return (
-        res["execution_id"],
-        res["start_time"],
-        res["duration"],
-        str(res["passed"]),
-        str(res["failed"]),
-        str(res["errored"]),
+        stepper,
+        pass_disp,
+        fail_disp,
+        error_disp,
+        score_disp,
         live_items,
+        dur_str,
+        interval_off,
+        btn_disabled,
+        btn_cancel_off,
+        hist_rows,
+        updated_store,
     )
 
-# 7. Downloads: Export CSV & Download Reports (Phase 6 Multi-Report Engine)
+
+# Callback E4: Load / Filter history table
 @app.callback(
-    Output("download-csv-action", "data"),
-    [Input("btn-export-results-csv", "n_clicks"),
-     Input("btn-download-alert-report", "n_clicks"),
-     Input("btn-download-selected-report", "n_clicks")],
-    State("select-report-type", "value"),
+    Output("exec-history-table-body", "children"),
+    [Input("exec-select-project", "value"),
+     Input("exec-select-dataset", "value"),
+     Input("exec-hist-filter-trigger", "value"),
+     Input("exec-hist-filter-status", "value"),
+     Input("exec-hist-search", "value")],
+    prevent_initial_call=False,
+)
+def update_exec_history_table(proj, ds, trig, st, search):
+    return _render_history_table(
+        project_name=proj,
+        dataset_name=ds,
+        trigger_type=trig,
+        status_filter=st,
+        search=search
+    )
+
+
+# Callback E5: History Row Actions (Details modal, Retry failed, Download CSV)
+@app.callback(
+    [Output("exec-details-modal", "is_open"),
+     Output("exec-details-modal-title", "children"),
+     Output("exec-details-modal-body", "children"),
+     Output("exec-selected-rules-store", "data"),
+     Output("exec-download-csv", "data"),
+     Output("exec-store", "data", allow_duplicate=True),
+     Output("exec-interval", "disabled", allow_duplicate=True),
+     Output("btn-trigger-validation", "disabled", allow_duplicate=True),
+     Output("btn-cancel-execution", "disabled", allow_duplicate=True),
+     Output("exec-history-table-body", "children", allow_duplicate=True)],
+    [Input({"type": "btn-exec-details", "id": dash.ALL}, "n_clicks"),
+     Input({"type": "btn-exec-retry", "id": dash.ALL}, "n_clicks"),
+     Input({"type": "btn-exec-csv", "id": dash.ALL}, "n_clicks"),
+     Input("btn-modal-download-csv", "n_clicks"),
+     Input("btn-close-details-modal", "n_clicks")],
+    [State("exec-selected-rules-store", "data"),
+     State("exec-select-project", "value"),
+     State("exec-select-dataset", "value")],
     prevent_initial_call=True,
 )
-def handle_csv_downloads(results_click, alert_click, selected_report_click, selected_report_type):
+def handle_exec_history_row_actions(det_clicks, retry_clicks, csv_clicks,
+                                    modal_csv_click, close_click, stored_modal_id,
+                                    proj, ds):
     trig = ctx.triggered_id
-    if trig == "btn-export-results-csv":
-        df = db_adapter.get_dq_results_table()
-        return dcc.send_data_frame(df.to_csv, "dq_results_report.csv", index=False)
-    elif trig == "btn-download-alert-report":
-        data = db_adapter.get_alerts_data()
-        return dcc.send_data_frame(data["alerts_table"].to_csv, "dq_alerts_summary.csv", index=False)
-    elif trig == "btn-download-selected-report":
-        rtype = selected_report_type or "PROJECT_WISE"
-        df = db_adapter.generate_report(rtype)
-        fname = f"dq_{rtype.lower()}_report.csv"
-        return dcc.send_data_frame(df.to_csv, fname, index=False)
-    return None
+    if not trig:
+        return (dash.no_update,) * 10
+
+    # Close modal
+    if trig == "btn-close-details-modal":
+        return False, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+    # CSV Download from modal
+    if trig == "btn-modal-download-csv":
+        if stored_modal_id:
+            csv_str = db_adapter.export_execution_report_csv(stored_modal_id)
+            csv_file = dcc.send_string(csv_str, filename=f"DQ_Execution_{stored_modal_id}.csv")
+            return dash.no_update, dash.no_update, dash.no_update, dash.no_update, csv_file, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+    if isinstance(trig, dict) and _real_click():
+        action_type = trig.get("type")
+        exec_id = str(trig.get("id"))
+
+        # Details modal open
+        if action_type == "btn-exec-details":
+            title = f"Execution Run Details: {exec_id}"
+            body = _render_execution_details_modal_content(exec_id)
+            return True, title, body, exec_id, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+        # Retry execution
+        elif action_type == "btn-exec-retry":
+            res = db_adapter.retry_execution(exec_id, retry_failed_only=True, user="admin")
+            new_exec_id = res.get("execution_id")
+            new_store = {
+                "execution_id": new_exec_id,
+                "project": proj,
+                "dataset": ds,
+                "start_time": res.get("start_time"),
+                "_started_ts": time.time()
+            }
+            hist_rows = _render_history_table(project_name=proj, dataset_name=ds)
+            return False, dash.no_update, dash.no_update, dash.no_update, dash.no_update, new_store, False, True, False, hist_rows
+
+        # Download CSV
+        elif action_type == "btn-exec-csv":
+            csv_str = db_adapter.export_execution_report_csv(exec_id)
+            csv_file = dcc.send_string(csv_str, filename=f"DQ_Execution_{exec_id}.csv")
+            return dash.no_update, dash.no_update, dash.no_update, dash.no_update, csv_file, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+    return (dash.no_update,) * 10
+
+
+# Callback E5: Render history table in proper <table> wrapper
+# (the children of exec-history-table-body are <tr> elements, wrap them)
+# Note: exec-history-table-body stores <tr> rows directly; we wrap via layout
+
+# 7. CSV downloads are handled by page-specific callbacks (results, reconciliation, reports).
 
 # =============================================================================
 # PHASE 8: RULE LIBRARY CALLBACKS
 # =============================================================================
+
+# Page 3: Rule Library callbacks ---------------------------------------------
+@app.callback(
+    Output("template-tiles-container", "children"),
+    Input("input-search-template", "value"),
+)
+def filter_template_tiles(search_term):
+    return _render_template_tiles(search_term)
+
 
 # Callback 1: Project Selection → Dataset Dropdown Refresh
 @app.callback(
@@ -2325,10 +5203,60 @@ def update_dataset_dropdown(selected_project):
     if not selected_project:
         return [], None
     
-    datasets = db_adapter.get_datasets_for_project(selected_project)
+    datasets = db_adapter.get_datasets_for_project(selected_project, include_inactive=False)
     options = [{"label": ds, "value": ds} for ds in datasets]
     value = datasets[0] if datasets else None
     return options, value
+
+
+# Callback 1.1: Project/Dataset Selection → Dynamic Column Dropdown Refresh
+@app.callback(
+    [Output("rule-select-column", "options"),
+     Output("rule-select-column", "value", allow_duplicate=True),
+     Output("rule-select-column", "disabled", allow_duplicate=True),
+     Output("rule-column-status-msg", "children", allow_duplicate=True)],
+    [Input("rule-select-project", "value"),
+     Input("rule-select-dataset", "value")],
+    [State("current-template-name", "data")],
+    prevent_initial_call="initial_duplicate",
+)
+def update_column_dropdown(proj_name, ds_name, current_tmpl):
+    if not proj_name or not ds_name:
+        return [{"label": "Select a column...", "value": ""}], None, True, "Please select a project and dataset first"
+    
+    cols = db_adapter.get_table_columns(proj_name, ds_name)
+    if not cols:
+        return [{"label": "No columns found for this dataset", "value": ""}], None, True, "No columns found for this dataset"
+    
+    # Check if current template requires column
+    tmpl_df = db_adapter.get_rule_templates()
+    tmpl = tmpl_df[tmpl_df["template_name"] == current_tmpl] if not tmpl_df.empty and current_tmpl else pd.DataFrame()
+    requires_col = bool(tmpl.iloc[0]["requires_column"]) if not tmpl.empty and "requires_column" in tmpl.columns else True
+    
+    options = [{"label": "Select a column...", "value": ""}] + [{"label": c, "value": c} for c in cols]
+    
+    if not requires_col:
+        return options, None, True, "Column selection not required for this rule template"
+    
+    return options, None, False, f"{len(cols)} columns available from {ds_name}"
+
+
+# Callback 1.2: Column Selection → Auto Suggest Rule Name
+@app.callback(
+    Output("rule-input-name", "value", allow_duplicate=True),
+    Input("rule-select-column", "value"),
+    [State("current-template-name", "data"),
+     State("rule-input-name", "value")],
+    prevent_initial_call=True,
+)
+def auto_update_rule_name(selected_col, current_tmpl, current_name):
+    if not selected_col:
+        return dash.no_update
+    tmpl = current_tmpl or "RULE"
+    if not current_name or current_name == tmpl or current_name.startswith(f"{tmpl}_"):
+        return f"{tmpl}_{selected_col}"
+    return dash.no_update
+
 
 # Callback 1.5: Clear search input when project/dataset changes
 @app.callback(
@@ -2347,10 +5275,12 @@ def clear_search_on_project_dataset_change(proj_name, ds_name):
     [Input("rule-select-project", "value"),
      Input("rule-select-dataset", "value"),
      Input("rule-refresh-store", "data"),
-     Input("input-search-rules", "value")],
+     Input("input-search-rules", "value"),
+     Input("filter-rules-category", "value"),
+     Input("filter-rules-severity", "value")],
     prevent_initial_call=False,
 )
-def refresh_configured_rules_table(proj_name, ds_name, refresh_signal, search_term):
+def refresh_configured_rules_table(proj_name, ds_name, refresh_signal, search_term, category_filter, severity_filter):
     if not proj_name or not ds_name:
         return []
     
@@ -2373,15 +5303,11 @@ def refresh_configured_rules_table(proj_name, ds_name, refresh_signal, search_te
     
     dataset_id = int(ds_df.iloc[0]["dataset_id"])
     
-    # Fetch rules
-    rules_df = db_adapter.get_configured_rules(project_id, dataset_id)
-    
-    # Filter by search term if provided
-    if search_term:
-        rules_df = rules_df[
-            (rules_df["rule_name"].str.contains(search_term, case=False, na=False)) |
-            (rules_df["column_name"].str.contains(search_term, case=False, na=False))
-        ]
+    # Fetch rules with database-level filtering
+    rules_df = db_adapter.get_configured_rules(project_id, dataset_id,
+                                               category_filter=category_filter,
+                                               severity_filter=severity_filter,
+                                               search=search_term)
     
     table_rows = []
     for _, r in rules_df.iterrows():
@@ -2398,63 +5324,105 @@ def refresh_configured_rules_table(proj_name, ds_name, refresh_signal, search_te
             html.Td(html.Span(status_text, className=status_badge)),
             html.Td(str(r["created_at"])),
             html.Td([
-                dbc.Button("View SQL", id={"type": "btn-view-sql-rule", "index": rule_id}, size="sm", color="light", className="me-1", style={"fontSize": "0.75rem"}),
-                dbc.Button("Edit", id={"type": "btn-edit-rule", "index": rule_id}, size="sm", color="info", className="me-1", style={"fontSize": "0.75rem"}),
-                dbc.Button("Delete", id={"type": "btn-delete-rule", "index": rule_id}, size="sm", color="danger", className="me-1", style={"fontSize": "0.75rem"}),
-                dbc.Button("Toggle", id={"type": "btn-toggle-rule", "index": rule_id}, size="sm", color="warning", style={"fontSize": "0.75rem"}),
-            ], style={"whiteSpace": "nowrap"}),
+                dbc.Button("View SQL", id={"type": "btn-view-sql-rule", "index": rule_id}, size="sm", color="light", className="me-1 mb-1", style={"fontSize": "0.7rem", "whiteSpace": "nowrap"}),
+                dbc.Button("Edit", id={"type": "btn-edit-rule", "index": rule_id}, size="sm", color="info", className="me-1 mb-1", style={"fontSize": "0.7rem", "whiteSpace": "nowrap"}),
+                dbc.Button("Delete", id={"type": "btn-delete-rule", "index": rule_id}, size="sm", color="danger", className="me-1 mb-1", style={"fontSize": "0.7rem", "whiteSpace": "nowrap"}),
+                dbc.Button("Toggle", id={"type": "btn-toggle-rule", "index": rule_id}, size="sm", color="warning", style={"fontSize": "0.7rem", "whiteSpace": "nowrap"}),
+            ], style={"minWidth": "280px"}),
         ]))
     
     return table_rows if table_rows else [html.Tr([html.Td("No rules configured yet.", colSpan=7, className="text-center text-muted")])]
 
 # Callback 3: Template Tile Click → Populate Configuration Form
 @app.callback(
-    [Output("rule-input-name", "value"),
-     Output("rule-input-column", "placeholder"),
-     Output("rule-input-threshold", "value"),
+    [Output("rule-input-name", "value", allow_duplicate=True),
+     Output("rule-select-column", "disabled", allow_duplicate=True),
+     Output("rule-select-column", "value", allow_duplicate=True),
+     Output("rule-column-status-msg", "children", allow_duplicate=True),
+     Output("rule-col-required-star", "style"),
+     Output("rule-input-threshold", "value", allow_duplicate=True),
+     Output("rule-selected-template-badge", "children"),
      Output("current-template-name", "data")],
     Input({"type": "template-tile", "index": dash.ALL}, "n_clicks"),
+    [State("rule-select-project", "value"),
+     State("rule-select-dataset", "value"),
+     State("rule-select-column", "value")],
     prevent_initial_call=True,
 )
-def on_template_tile_click(n_clicks):
-    if not ctx.triggered:
-        return "NULL_COUNT", "Column name (required)", "0", "NULL_COUNT"
+def on_template_tile_click(n_clicks_list, proj_name, ds_name, current_col):
+    if not _real_click():
+        return (dash.no_update,) * 8
     
     trig = ctx.triggered_id
     if not isinstance(trig, dict):
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return (dash.no_update,) * 8
     
     template_name = trig.get("index")
     if not template_name:
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return (dash.no_update,) * 8
     
     # Get template details
     template_df = db_adapter.get_rule_templates()
     tmpl = template_df[template_df["template_name"] == template_name]
     
     if tmpl.empty:
-        return template_name, "Column name", "0", template_name
+        return template_name, False, None, "", {"display": "inline"}, "0", template_name, template_name
     
     tmpl_row = tmpl.iloc[0]
     requires_col = bool(tmpl_row["requires_column"])
     default_threshold = tmpl_row["default_threshold"]
     
-    col_placeholder = "Column name (required)" if requires_col else "Column name (optional)"
+    cols = db_adapter.get_table_columns(proj_name, ds_name) if (proj_name and ds_name) else []
     
-    return template_name, col_placeholder, str(default_threshold), template_name
+    if not requires_col:
+        # Template does not require column (e.g. ROW_COUNT, SCHEMA_CHANGE)
+        return (
+            template_name,
+            True,  # disabled
+            "",    # empty column value
+            "Column selection not required for this rule template",
+            {"display": "none"},  # hide required star
+            str(default_threshold),
+            template_name,
+            template_name,
+        )
+    else:
+        # Template requires column
+        col_status = f"{len(cols)} columns available from {ds_name}" if cols else "No columns found for this dataset"
+        col_disabled = len(cols) == 0
+        rule_name = f"{template_name}_{current_col}" if current_col else template_name
+        return (
+            rule_name,
+            col_disabled,
+            current_col if (current_col in cols) else None,
+            col_status,
+            {"display": "inline"},  # show required star
+            str(default_threshold),
+            template_name,
+            template_name,
+        )
 
-# Callback 4: Preview SQL Button → Show Modal with Generated SQL
+# Callback 4: Preview SQL Button → Show Modal with Generated SQL (handles both open and close)
 @app.callback(
     [Output("modal-preview-sql", "is_open"),
      Output("preview-sql-code", "children")],
-    Input("btn-preview-sql", "n_clicks"),
+    [Input("btn-preview-sql", "n_clicks"),
+     Input("btn-close-sql-modal", "n_clicks")],
     [State("rule-select-project", "value"),
      State("rule-select-dataset", "value"),
      State("current-template-name", "data"),
-     State("rule-input-column", "value")],
+     State("rule-select-column", "value")],
     prevent_initial_call=True,
 )
-def show_preview_sql(n_clicks, proj_name, ds_name, template_name, column_name):
+def show_preview_sql(preview_clicks, close_clicks, proj_name, ds_name, template_name, column_name):
+    if not _real_click():
+        return dash.no_update, dash.no_update
+
+    # If close button was clicked, close the modal
+    if ctx.triggered_id == "btn-close-sql-modal":
+        return False, ""
+    
+    # Otherwise, preview button was clicked - open modal and generate SQL
     if not proj_name or not ds_name or not template_name:
         return True, "-- Please select project, dataset, and template first"
     
@@ -2482,24 +5450,16 @@ def show_preview_sql(n_clicks, proj_name, ds_name, template_name, column_name):
     
     return True, sql
 
-# Callback 5: Close SQL Modal
-@app.callback(
-    Output("modal-preview-sql", "is_open"),
-    Input("btn-close-sql-modal", "n_clicks"),
-    State("modal-preview-sql", "is_open"),
-    prevent_initial_call=True,
-)
-def close_sql_modal(n_clicks, is_open):
-    return False
+
 
 # Callback 6: Save Rule Button → Validate, Insert, Show Toast, Refresh Table
 @app.callback(
-    [Output("global-toast", "is_open"),
-     Output("global-toast", "children"),
-     Output("rule-refresh-store", "data"),
-     Output("rule-input-name", "value"),
-     Output("rule-input-column", "value"),
-     Output("rule-input-threshold", "value"),
+    [Output("global-toast", "is_open", allow_duplicate=True),
+     Output("global-toast", "children", allow_duplicate=True),
+     Output("rule-refresh-store", "data", allow_duplicate=True),
+     Output("rule-input-name", "value", allow_duplicate=True),
+     Output("rule-select-column", "value", allow_duplicate=True),
+     Output("rule-input-threshold", "value", allow_duplicate=True),
      Output("rule-select-severity", "value"),
      Output("rule-switch-active", "value")],
     Input("btn-save-rule", "n_clicks"),
@@ -2507,7 +5467,7 @@ def close_sql_modal(n_clicks, is_open):
      State("rule-select-dataset", "value"),
      State("current-template-name", "data"),
      State("rule-input-name", "value"),
-     State("rule-input-column", "value"),
+     State("rule-select-column", "value"),
      State("rule-input-threshold", "value"),
      State("rule-select-severity", "value"),
      State("rule-switch-active", "value")],
@@ -2515,9 +5475,12 @@ def close_sql_modal(n_clicks, is_open):
 )
 def handle_save_rule(n_clicks, proj_name, ds_name, template_name, rule_name, column_name, 
                      threshold, severity, active):
+    if not _real_click():
+        return (dash.no_update,) * 8
+
     # Validate inputs
     if not proj_name or not ds_name or not template_name or not rule_name:
-        return True, dbc.Alert("All fields are required", color="danger"), dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return True, dbc.Alert("All fields are required. Please select Project, Dataset, Template, and provide a Rule Name.", color="danger"), dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
     
     # Get project and dataset IDs
     proj_df = db_adapter.query_df(
@@ -2538,6 +5501,18 @@ def handle_save_rule(n_clicks, proj_name, ds_name, template_name, rule_name, col
     
     dataset_id = int(ds_df.iloc[0]["dataset_id"])
     
+    # Check template column requirement
+    tmpl_df = db_adapter.get_rule_templates()
+    tmpl = tmpl_df[tmpl_df["template_name"] == template_name]
+    requires_col = bool(tmpl.iloc[0]["requires_column"]) if not tmpl.empty else True
+    
+    if requires_col and (not column_name or not str(column_name).strip()):
+        return True, dbc.Alert(f"Template '{template_name}' requires a column. Please select a column from the dropdown.", color="danger"), dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+    if not requires_col:
+        if not column_name or str(column_name).strip() in ["-", "None", "", "Select a column..."]:
+            column_name = None
+
     # Try to save the rule
     try:
         threshold = float(threshold)
@@ -2551,16 +5526,17 @@ def handle_save_rule(n_clicks, proj_name, ds_name, template_name, rule_name, col
     
     if result["success"]:
         toast_msg = dbc.Alert(result["message"], color="success")
-        return True, toast_msg, datetime.now().timestamp(), "NULL_COUNT", "", "0", "High", True
+        return True, toast_msg, datetime.now().timestamp(), template_name, None, "0", "High", True
     else:
         toast_msg = dbc.Alert(result["message"], color="danger")
         return True, toast_msg, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
 # Callback 7: Edit Button → Open Modal with Pre-filled Values
 @app.callback(
-    [Output("modal-edit-rule", "is_open"),
+    [Output("modal-edit-rule", "is_open", allow_duplicate=True),
      Output("edit-rule-id", "data"),
      Output("edit-rule-name", "value"),
+     Output("edit-rule-column", "options"),
      Output("edit-rule-column", "value"),
      Output("edit-rule-threshold", "value"),
      Output("edit-rule-severity", "value"),
@@ -2568,19 +5544,37 @@ def handle_save_rule(n_clicks, proj_name, ds_name, template_name, rule_name, col
     Input({"type": "btn-edit-rule", "index": dash.ALL}, "n_clicks"),
     prevent_initial_call=True,
 )
-def open_edit_rule_modal(n_clicks):
-    if not ctx.triggered:
-        return False, None, "", "", "0", "High", True
+def open_edit_rule_modal(n_clicks_list):
+    if not _real_click():
+        return (dash.no_update,) * 8
     
     trig = ctx.triggered_id
     if not isinstance(trig, dict):
-        return False, None, "", "", "0", "High", True
+        return False, None, "", [], "", "0", "High", True
     
     rule_id = trig.get("index")
     if not rule_id:
-        return False, None, "", "", "0", "High", True
+        return False, None, "", [], "", "0", "High", True
     
     # Fetch rule details
+    rule_data = db_adapter.get_rule_details(rule_id)
+    
+    if "error" in rule_data:
+        return False, None, "", [], "", "0", "High", True
+    
+    cols = db_adapter.get_table_columns(rule_data["project_id"], rule_data["dataset_id"])
+    col_options = [{"label": "None (optional)", "value": ""}] + [{"label": c, "value": c} for c in cols]
+    
+    return (
+        True,
+        rule_id,
+        rule_data["rule_name"],
+        col_options,
+        rule_data["column_name"] or "",
+        str(rule_data["threshold"]),
+        rule_data["severity"],
+        rule_data["active"]
+    )
     rule_data = db_adapter.get_rule_details(rule_id)
     
     if "error" in rule_data:
@@ -2598,7 +5592,7 @@ def open_edit_rule_modal(n_clicks):
 
 # Callback 8: Cancel Edit Modal
 @app.callback(
-    Output("modal-edit-rule", "is_open"),
+    Output("modal-edit-rule", "is_open", allow_duplicate=True),
     Input("btn-cancel-edit-rule", "n_clicks"),
     State("modal-edit-rule", "is_open"),
     prevent_initial_call=True,
@@ -2608,10 +5602,10 @@ def close_edit_modal(n_clicks, is_open):
 
 # Callback 9: Submit Edit Modal → Update Rule
 @app.callback(
-    [Output("modal-edit-rule", "is_open"),
-     Output("global-toast", "is_open"),
-     Output("global-toast", "children"),
-     Output("rule-refresh-store", "data")],
+    [Output("modal-edit-rule", "is_open", allow_duplicate=True),
+     Output("global-toast", "is_open", allow_duplicate=True),
+     Output("global-toast", "children", allow_duplicate=True),
+     Output("rule-refresh-store", "data", allow_duplicate=True)],
     Input("btn-submit-edit-rule", "n_clicks"),
     [State("edit-rule-id", "data"),
      State("edit-rule-name", "value"),
@@ -2641,14 +5635,14 @@ def handle_update_rule(n_clicks, rule_id, rule_name, column_name, threshold, sev
 
 # Callback 10: Delete Button → Show Confirmation Modal
 @app.callback(
-    [Output("modal-delete-confirm", "is_open"),
+    [Output("modal-delete-confirm", "is_open", allow_duplicate=True),
      Output("delete-rule-id", "data")],
     Input({"type": "btn-delete-rule", "index": dash.ALL}, "n_clicks"),
     prevent_initial_call=True,
 )
-def show_delete_confirm(n_clicks):
-    if not ctx.triggered:
-        return False, None
+def show_delete_confirm(n_clicks_list):
+    if not _real_click():
+        return dash.no_update, dash.no_update
     
     trig = ctx.triggered_id
     if not isinstance(trig, dict):
@@ -2659,10 +5653,10 @@ def show_delete_confirm(n_clicks):
 
 # Callback 11: Confirm Delete → Delete Rule & Refresh Table
 @app.callback(
-    [Output("modal-delete-confirm", "is_open"),
-     Output("global-toast", "is_open"),
-     Output("global-toast", "children"),
-     Output("rule-refresh-store", "data")],
+    [Output("modal-delete-confirm", "is_open", allow_duplicate=True),
+     Output("global-toast", "is_open", allow_duplicate=True),
+     Output("global-toast", "children", allow_duplicate=True),
+     Output("rule-refresh-store", "data", allow_duplicate=True)],
     Input("btn-confirm-delete-rule", "n_clicks"),
     State("delete-rule-id", "data"),
     prevent_initial_call=True,
@@ -2682,7 +5676,7 @@ def handle_delete_rule(n_clicks, rule_id):
 
 # Callback 12: Cancel Delete Modal
 @app.callback(
-    Output("modal-delete-confirm", "is_open"),
+    Output("modal-delete-confirm", "is_open", allow_duplicate=True),
     Input("btn-cancel-delete-rule", "n_clicks"),
     State("modal-delete-confirm", "is_open"),
     prevent_initial_call=True,
@@ -2692,15 +5686,15 @@ def close_delete_modal(n_clicks, is_open):
 
 # Callback 13: Toggle Rule Active Status
 @app.callback(
-    [Output("global-toast", "is_open"),
-     Output("global-toast", "children"),
-     Output("rule-refresh-store", "data")],
+    [Output("global-toast", "is_open", allow_duplicate=True),
+     Output("global-toast", "children", allow_duplicate=True),
+     Output("rule-refresh-store", "data", allow_duplicate=True)],
     Input({"type": "btn-toggle-rule", "index": dash.ALL}, "n_clicks"),
     prevent_initial_call=True,
 )
-def handle_toggle_rule(n_clicks):
-    if not ctx.triggered:
-        return False, "", dash.no_update
+def handle_toggle_rule(n_clicks_list):
+    if not _real_click():
+        return dash.no_update, dash.no_update, dash.no_update
     
     trig = ctx.triggered_id
     if not isinstance(trig, dict):
@@ -2719,16 +5713,16 @@ def handle_toggle_rule(n_clicks):
         toast_msg = dbc.Alert(result["message"], color="danger")
         return True, toast_msg, dash.no_update
 
-# Callback 14: View SQL Rule Button
+# Callback 14: View SQL Rule Button (uses separate modal to avoid conflicts)
 @app.callback(
-    [Output("modal-preview-sql", "is_open"),
-     Output("preview-sql-code", "children")],
+    [Output("modal-view-rule-sql", "is_open", allow_duplicate=True),
+     Output("view-rule-sql-code", "children")],
     Input({"type": "btn-view-sql-rule", "index": dash.ALL}, "n_clicks"),
     prevent_initial_call=True,
 )
-def view_rule_sql(n_clicks):
-    if not ctx.triggered:
-        return False, ""
+def view_rule_sql(view_clicks):
+    if not _real_click():
+        return dash.no_update, dash.no_update
     
     trig = ctx.triggered_id
     if not isinstance(trig, dict):
@@ -2754,67 +5748,370 @@ def view_rule_sql(n_clicks):
     
     return True, sql
 
-# 8. Filter Results on Page 5
+# Callback 14b: Close Rule SQL Modal
 @app.callback(
-    Output("results-table-body", "children"),
-    [Input("filter-results-status", "value"),
-     Input("filter-results-project", "value")],
+    Output("modal-view-rule-sql", "is_open", allow_duplicate=True),
+    Input("btn-close-rule-sql-modal", "n_clicks"),
+    State("modal-view-rule-sql", "is_open"),
+    prevent_initial_call=True,
 )
-def filter_results_table(status_filter, proj_filter):
-    df = db_adapter.get_dq_results_table(status=status_filter)
-    rows = []
-    for _, r in df.iterrows():
-        s = str(r["status"])
-        badge_cls = "badge-pass" if s == "PASS" else ("badge-fail" if s == "FAIL" else "badge-error")
-        rows.append(html.Tr([
-            html.Td(r["rule_name"], style={"fontWeight": "600"}),
-            html.Td(r["category"]),
-            html.Td(html.Span(s, className=badge_cls)),
-            html.Td(str(r["failure_count"])),
-            html.Td(str(r["observed_value"] or "-")),
-            html.Td(str(r["expected_value"] or "-")),
-            html.Td(str(r["executed_at"])),
-        ]))
-    return rows
+def close_rule_sql_modal(n_clicks, is_open):
+    return False
 
-# 8b. Filter Alerts on Page 7 (Phase 6)
+# 8. DQ Results page (Page 5) ------------------------------------------------
 @app.callback(
-    Output("alerts-table-body", "children"),
-    [Input("filter-alert-status", "value"),
-     Input("filter-alert-severity", "value")],
+    [Output("filter-results-dataset", "options"),
+     Output("filter-results-dataset", "value")],
+    Input("filter-results-project", "value"),
 )
-def filter_alerts_table(status, sev):
-    data = db_adapter.get_alerts_data(status_filter=status, severity_filter=sev)
-    df = data["alerts_table"]
-    alert_rows = []
-    for _, a in df.iterrows():
-        a_id = int(a["alert_id"])
-        severity = str(a["severity"])
-        st = str(a["status"])
-        
-        sev_color = "#EF4444" if severity == "Critical" else ("#F97316" if severity == "High" else ("#F59E0B" if severity == "Medium" else "#10B981"))
-        badge_style = {"backgroundColor": sev_color + "22", "color": sev_color, "fontWeight": "600", "padding": "4px 8px", "borderRadius": "12px", "fontSize": "0.75rem"}
-        
-        actions = []
-        if st == "Active":
-            actions.append(dbc.Button("Acknowledge", id={"type": "btn-ack-alert", "id": a_id}, size="sm", color="primary", outline=True, style={"fontSize": "0.75rem", "padding": "2px 8px"}, className="me-1"))
-            actions.append(dbc.Button("Close", id={"type": "btn-close-alert", "id": a_id}, size="sm", color="danger", outline=True, style={"fontSize": "0.75rem", "padding": "2px 8px"}))
-        elif st == "Acknowledged":
-            actions.append(dbc.Button("Close", id={"type": "btn-close-alert", "id": a_id}, size="sm", color="danger", outline=True, style={"fontSize": "0.75rem", "padding": "2px 8px"}, className="me-1"))
-            actions.append(html.Span(f"Ack by {a.get('acknowledged_by') or 'admin'}", className="text-muted small"))
+def results_dataset_options(proj):
+    ds = db_adapter.get_datasets_for_project(proj, include_inactive=True) if proj and proj != "All" else []
+    return [{"label": "Dataset: All", "value": "All"}] + [{"label": d, "value": d} for d in ds], "All"
+
+
+@app.callback(
+    [Output("results-table-body", "children"),
+     Output("results-count-label", "children")],
+    [Input("filter-results-project", "value"),
+     Input("filter-results-dataset", "value"),
+     Input("filter-results-category", "value"),
+     Input("filter-results-severity", "value"),
+     Input("filter-results-status", "value"),
+     Input("filter-results-exec", "value"),
+     Input("filter-results-rule", "value")],
+)
+def filter_results_table(proj, ds, cat, sev, status, exec_id, rule):
+    df = db_adapter.get_dq_results_table(project_name=proj, dataset_name=ds, status=status,
+                                         severity=sev, category=cat, execution_id=exec_id, rule_search=rule)
+    return _results_rows(df), f"{len(df)} result(s) (latest 200 shown)"
+
+
+@app.callback(
+    Output("download-csv-action", "data", allow_duplicate=True),
+    Input("btn-export-results-csv", "n_clicks"),
+    [State("filter-results-project", "value"),
+     State("filter-results-dataset", "value"),
+     State("filter-results-category", "value"),
+     State("filter-results-severity", "value"),
+     State("filter-results-status", "value"),
+     State("filter-results-exec", "value"),
+     State("filter-results-rule", "value")],
+    prevent_initial_call=True,
+)
+def export_results_csv(n, proj, ds, cat, sev, status, exec_id, rule):
+    if not n:
+        return dash.no_update
+    df = db_adapter.get_dq_results_table(project_name=proj, dataset_name=ds, status=status,
+                                         severity=sev, category=cat, execution_id=exec_id, rule_search=rule)
+    return dcc.send_data_frame(df.to_csv, "dq_results_report.csv", index=False)
+
+
+@app.callback(
+    [Output("modal-result-detail", "is_open"),
+     Output("result-detail-title", "children"),
+     Output("result-detail-body", "children")],
+    [Input({"type": "btn-inspect-result", "id": dash.ALL}, "n_clicks"),
+     Input("btn-close-result-detail", "n_clicks")],
+    prevent_initial_call=True,
+)
+def inspect_result(clicks, close):
+    trig = ctx.triggered_id
+    if trig == "btn-close-result-detail":
+        return False, dash.no_update, dash.no_update
+    if not isinstance(trig, dict) or not _real_click():
+        return dash.no_update, dash.no_update, dash.no_update
+    det = db_adapter.get_result_detail_and_failed_records(int(trig["id"]))
+    if not det:
+        return True, "Result Detail", html.Div("Result not found.", className="text-muted")
+    r = det["result"]
+    fr = det["failed_records"]
+    if fr is not None and not fr.empty:
+        sample = html.Div(html.Table([
+            html.Thead(html.Tr([html.Th(c) for c in fr.columns])),
+            html.Tbody([html.Tr([html.Td(str(v)) for v in row]) for row in fr.head(10).values.tolist()]),
+        ], className="clean-table", style={"fontSize": "0.78rem"}), style={"overflowX": "auto"})
+    else:
+        sample = html.Div("No failing sample records (rule passed, errored, or is an aggregate check).",
+                          className="text-muted small")
+    body = html.Div([
+        dbc.Row([
+            dbc.Col([html.Div("Status", className="small text-muted"), html.B(str(r.get("status")))], md=2),
+            dbc.Col([html.Div("Template", className="small text-muted"), html.B(det["template_name"])], md=3),
+            dbc.Col([html.Div("Column", className="small text-muted"), html.B(det["column_name"])], md=2),
+            dbc.Col([html.Div("Observed / Expected", className="small text-muted"),
+                     html.B(f"{r.get('observed_value')} / {r.get('expected_value')}")], md=3),
+            dbc.Col([html.Div("Failures", className="small text-muted"), html.B(str(r.get("failure_count")))], md=2),
+        ], className="p-3 bg-light rounded mb-3"),
+        html.Div(f"Error: {r.get('error_message')}", className="text-danger small mb-2") if r.get("error_message") else None,
+        html.H6("Validation SQL", className="fw-bold"),
+        html.Pre(det["validation_sql"], style={"backgroundColor": "#0F172A", "color": "#E2E8F0", "padding": "12px",
+                                                "borderRadius": "6px", "fontSize": "0.8rem", "whiteSpace": "pre-wrap"}),
+        html.H6("Sample Failing Records", className="fw-bold mt-3"),
+        sample,
+    ])
+    return True, f"{r.get('rule_name')} — {r.get('execution_id')}", body
+
+
+# 8a. Reconciliation page (Page 6) ------------------------------------------
+@app.callback(
+    [Output("recon-select-dataset", "options"),
+     Output("recon-select-dataset", "value")],
+    Input("recon-select-project", "value"),
+    prevent_initial_call=True,
+)
+def recon_dataset_options(proj):
+    ds = db_adapter.get_datasets_for_project(proj, include_inactive=True) if proj else []
+    return [{"label": d, "value": d} for d in ds], (ds[0] if ds else None)
+
+
+@app.callback(
+    [Output("recon-content", "children"),
+     Output("recon-run-alert", "children")],
+    [Input("recon-select-project", "value"),
+     Input("recon-select-dataset", "value"),
+     Input("btn-run-recon", "n_clicks")],
+    State("recon-checks", "value"),
+)
+def render_reconciliation(proj, ds, run_clicks, checks):
+    if not proj or not ds:
+        return html.Div("Select a project and dataset.", className="text-muted p-3"), None
+    alert = None
+    try:
+        trig = ctx.triggered_id
+    except Exception:
+        trig = "btn-run-recon" if run_clicks else None
+    if trig == "btn-run-recon":
+        res = db_adapter.run_reconciliation(proj, ds, selected_checks=checks or None)
+        if res.get("success"):
+            alert = dbc.Alert(f"Reconciliation {res['execution_id']} completed: {res['status']}",
+                              color="success" if res["status"] == "PASS" else "warning",
+                              className="py-2 small", duration=6000)
         else:
-            actions.append(html.Span(f"Closed by {a.get('closed_by') or 'admin'}", className="text-muted small"))
+            alert = dbc.Alert(res.get("message", "Reconciliation failed."), color="danger", className="py-2 small")
+    return _recon_content(db_adapter.get_reconciliation_data(proj, ds)), alert
 
-        alert_rows.append(html.Tr([
-            html.Td(a["date_time"]),
-            html.Td(a["project_name"], style={"fontWeight": "500"}),
-            html.Td(a["rule_name"]),
-            html.Td(html.Span(severity, style=badge_style)),
-            html.Td(str(a.get("failure_count", 0))),
-            html.Td(html.Span(st, className="badge-pass" if st == "Closed" else ("badge-fail" if st == "Active" else "badge-error"))),
-            html.Td(actions),
-        ]))
-    return alert_rows
+
+@app.callback(
+    Output("download-csv-action", "data", allow_duplicate=True),
+    Input("btn-export-recon", "n_clicks"),
+    [State("recon-select-project", "value"),
+     State("recon-select-dataset", "value")],
+    prevent_initial_call=True,
+)
+def export_recon_csv(n, proj, ds):
+    if not n:
+        return dash.no_update
+    df = db_adapter.generate_report("RECONCILIATION")
+    if proj and not df.empty:
+        df = df[df["project_name"] == proj]
+        if ds:
+            df = df[df["dataset_name"] == ds]
+    return dcc.send_data_frame(df.to_csv, f"dq_reconciliation_{proj or 'all'}_{ds or 'all'}.csv", index=False)
+
+
+# 8b. Alerts & Reports page (Page 7) ----------------------------------------
+@app.callback(
+    [Output("filter-alert-dataset", "options"),
+     Output("filter-alert-dataset", "value")],
+    Input("filter-alert-project", "value"),
+)
+def alerts_dataset_options(proj):
+    ds = db_adapter.get_datasets_for_project(proj, include_inactive=True) if proj and proj != "All" else []
+    return [{"label": "Dataset: All", "value": "All"}] + [{"label": d, "value": d} for d in ds], "All"
+
+
+@app.callback(
+    [Output("alerts-table-body", "children"),
+     Output("alerts-kpi-row", "children"),
+     Output("alerts-severity-chart", "figure")],
+    [Input("filter-alert-status", "value"),
+     Input("filter-alert-severity", "value"),
+     Input("filter-alert-project", "value"),
+     Input("filter-alert-dataset", "value"),
+     Input("filter-alert-search", "value"),
+     Input("alert-refresh-store", "data")],
+)
+def filter_alerts_table(status, sev, proj, ds, search, _refresh):
+    data = db_adapter.get_alerts_data(status_filter=status, severity_filter=sev,
+                                      project_filter=proj, dataset_filter=ds, search=search)
+    kpi_row, fig = _alerts_kpis_and_chart(data)
+    return _alert_rows(data["alerts_table"]), kpi_row, fig
+
+
+@app.callback(
+    Output("download-csv-action", "data", allow_duplicate=True),
+    Input("btn-download-selected-report", "n_clicks"),
+    State("select-report-type", "value"),
+    prevent_initial_call=True,
+)
+def download_selected_report(n, rtype):
+    if not n:
+        return dash.no_update
+    rtype = rtype or "PROJECT_WISE"
+    df = db_adapter.generate_report(rtype)
+    return dcc.send_data_frame(df.to_csv, f"dq_{rtype.lower()}_report.csv", index=False)
+
+
+# 8b-1. Alerts Failure Details Modal Callback
+@app.callback(
+    [Output("modal-notif-detail", "is_open"),
+     Output("notif-detail-modal-title", "children"),
+     Output("notif-detail-modal-body", "children"),
+     Output("store-current-notif-alert-id", "data")],
+    [Input({"type": "btn-view-notif-err", "id": dash.ALL}, "n_clicks"),
+     Input("btn-close-notif-detail-modal", "n_clicks")],
+    [State("store-current-notif-alert-id", "data")],
+    prevent_initial_call=True,
+)
+def handle_notif_detail_modal(view_clicks, close_click, current_alert_id):
+    trig = ctx.triggered_id
+    if not trig or not _real_click():
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+    if trig == "btn-close-notif-detail-modal":
+        return False, dash.no_update, dash.no_update, dash.no_update
+
+    if isinstance(trig, dict) and trig.get("type") == "btn-view-notif-err":
+        alert_id = trig["id"]
+        body = _render_notif_detail_modal_body(alert_id)
+        title = [html.I(className="bi bi-bell-fill text-danger me-2"), f"Notification Delivery Failure Details — Alert #{alert_id}"]
+        return True, title, body, alert_id
+
+    return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+
+# 8b-2. Modal Retry Notification Callback
+@app.callback(
+    [Output("modal-notif-retry-feedback", "children"),
+     Output("alert-refresh-store", "data", allow_duplicate=True)],
+    Input("btn-modal-retry-notif-action", "n_clicks"),
+    State("store-current-notif-alert-id", "data"),
+    prevent_initial_call=True,
+)
+def handle_modal_retry_notif(n_clicks, alert_id):
+    if not n_clicks or not alert_id:
+        return dash.no_update, dash.no_update
+    res = db_adapter.retry_notification(alert_id, user="admin")
+    _ts = datetime.now().isoformat()
+    if res.get("success"):
+        feedback = dbc.Alert([
+            html.I(className="bi bi-check-circle-fill me-2"),
+            f"Notification retry succeeded! Status: {res.get('status')} via {res.get('provider')}."
+        ], color="success", className="small py-2 mb-0")
+    else:
+        err_msg = res.get("error") or res.get("message") or "Delivery failed"
+        feedback = dbc.Alert([
+            html.I(className="bi bi-exclamation-circle-fill me-2"),
+            f"Notification retry failed: {err_msg}"
+        ], color="danger", className="small py-2 mb-0")
+    return feedback, _ts
+
+
+# 8b-3. Email Configuration Modal Open/Close Callback
+@app.callback(
+    [Output("modal-email-config", "is_open"),
+     Output("email-config-modal-body", "children")],
+    [Input("btn-open-email-config", "n_clicks"),
+     Input("btn-close-email-config-modal", "n_clicks")],
+    prevent_initial_call=True,
+)
+def handle_email_config_modal(open_click, close_click):
+    trig = ctx.triggered_id
+    if not trig or not _real_click():
+        return dash.no_update, dash.no_update
+    if trig == "btn-close-email-config-modal":
+        return False, dash.no_update
+    if trig == "btn-open-email-config":
+        body = _render_email_config_modal_body()
+        return True, body
+    return dash.no_update, dash.no_update
+
+
+# 8b-4. Save SMTP Configuration Callback
+@app.callback(
+    Output("smtp-cfg-save-alert", "children"),
+    Input("btn-save-smtp-cfg", "n_clicks"),
+    [State("smtp-cfg-host", "value"),
+     State("smtp-cfg-port", "value"),
+     State("smtp-cfg-sender", "value"),
+     State("smtp-cfg-user", "value"),
+     State("smtp-cfg-pass", "value"),
+     State("smtp-cfg-tls", "value"),
+     State("smtp-cfg-ssl", "value")],
+    prevent_initial_call=True,
+)
+def save_smtp_cfg_callback(n, host, port, sender, user, pwd, tls, ssl):
+    if not n:
+        return dash.no_update
+    if not host or not str(host).strip():
+        return dbc.Alert("SMTP Host is required.", color="danger", className="small py-2 mb-0")
+    try:
+        p_num = int(port or 587)
+    except Exception:
+        return dbc.Alert("Invalid port number.", color="danger", className="small py-2 mb-0")
+
+    success, msg = db_adapter.update_smtp_configuration(
+        host=str(host).strip(),
+        port=p_num,
+        username=str(user or "").strip(),
+        password=str(pwd or "").strip(),
+        sender_email=str(sender or "").strip(),
+        use_tls=bool(tls),
+        use_ssl=bool(ssl),
+        user="admin"
+    )
+    if success:
+        return dbc.Alert([html.I(className="bi bi-check-circle-fill me-2"), msg], color="success", className="small py-2 mb-0")
+    else:
+        return dbc.Alert([html.I(className="bi bi-exclamation-circle-fill me-2"), msg], color="danger", className="small py-2 mb-0")
+
+
+# 8b-5. Test SMTP Connection Callback
+@app.callback(
+    Output("smtp-test-conn-result", "children"),
+    Input("btn-test-smtp-conn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def test_smtp_conn_callback(n):
+    if not n:
+        return dash.no_update
+    res = email_service.test_smtp_connection()
+    if res.get("connected"):
+        return dbc.Alert([
+            html.I(className="bi bi-check-circle-fill me-2"),
+            res.get("message", "Connection successful!"),
+        ], color="success", className="small py-2 mb-0")
+    else:
+        return dbc.Alert([
+            html.Div([html.I(className="bi bi-x-circle-fill me-2"), html.Strong(res.get("message"))]),
+            html.Div(f"Diagnostic Hint: {res.get('hint')}", className="text-muted mt-1") if res.get("hint") else html.Div(),
+        ], color="danger", className="small py-2 mb-0")
+
+
+# 8b-6. Send Test Verification Email Callback
+@app.callback(
+    Output("smtp-test-email-result", "children"),
+    Input("btn-send-test-email-action", "n_clicks"),
+    State("input-test-email-addr", "value"),
+    prevent_initial_call=True,
+)
+def send_test_email_callback(n, recipient):
+    if not n:
+        return dash.no_update
+    if not recipient or not str(recipient).strip():
+        return dbc.Alert("Recipient email address is required.", color="danger", className="small py-2 mb-0")
+    res = db_adapter.test_email_delivery(str(recipient).strip(), user="admin")
+    if res.get("success"):
+        return dbc.Alert([
+            html.I(className="bi bi-check-circle-fill me-2"),
+            res.get("message"),
+        ], color="success", className="small py-2 mb-0")
+    else:
+        return dbc.Alert([
+            html.I(className="bi bi-x-circle-fill me-2"),
+            res.get("message"),
+        ], color="danger", className="small py-2 mb-0")
+
 
 # 8c. Filter Audit Runs on Page 8 (Phase 6)
 @app.callback(
@@ -2855,20 +6152,25 @@ def show_audit_modal(view_clicks, close_click, is_open):
     trig = ctx.triggered_id
     if trig == "btn-close-audit-modal":
         return False, "", ""
+    if isinstance(trig, dict) and not _real_click():
+        return dash.no_update, dash.no_update, dash.no_update
     if isinstance(trig, dict) and trig.get("type") == "btn-view-audit":
         exec_id = trig["id"]
-        res_df = db_adapter.get_dq_results_table()
+        res_df = db_adapter.query_df("""
+            SELECT rule_name, category, status, failure_count, executed_at
+            FROM dq_results WHERE execution_id = ? ORDER BY result_id ASC
+        """, (exec_id,))
         
         detail_rows = [
             html.Tr([
                 html.Td(r["rule_name"], style={"fontWeight": "600"}),
                 html.Td(r["category"]),
-                html.Td(html.Span(r["status"], className="badge-pass" if r["status"] == "PASS" else "badge-fail")),
+                html.Td(html.Span(r["status"], className="badge-pass" if r["status"] == "PASS" else ("badge-fail" if r["status"] == "FAIL" else "badge-error"))),
                 html.Td(str(r["failure_count"])),
                 html.Td(str(r["executed_at"])),
             ])
             for _, r in res_df.iterrows()
-        ]
+        ] or [html.Tr([html.Td("No rule results recorded for this execution.", colSpan=5, className="text-center text-muted")])]
         
         body = html.Div([
             html.P(f"Execution run details and rule evaluations for run ID: {exec_id}", className="text-muted"),
@@ -2884,12 +6186,101 @@ def show_audit_modal(view_clicks, close_click, is_open):
             ], className="clean-table"),
         ])
         return True, f"Execution Breakdown: {exec_id}", body
-    return is_open, "", ""
+    return dash.no_update, dash.no_update, dash.no_update
+
+# -------------------------------------------------------------
+# REST API ENDPOINTS (PHASE 8: EMAIL NOTIFICATIONS & ALERT LIFECYCLE)
+# -------------------------------------------------------------
+
+@server.route("/api/projects/<int:project_id>/notifications", methods=["GET", "PUT"])
+def api_project_notifications(project_id):
+    if request.method == "GET":
+        settings = db_adapter.get_project_notification_settings(project_id)
+        if not settings:
+            return jsonify({"error": f"Project ID {project_id} not found"}), 404
+        return jsonify(settings), 200
+    elif request.method == "PUT":
+        data = request.get_json(silent=True) or {}
+        team_email = data.get("project_team_email")
+        add_emails = data.get("additional_emails", "")
+        notif_enabled = data.get("notification_enabled", True)
+        user = data.get("user", "api_user")
+        res = db_adapter.update_project_notification_settings(
+            project_id=project_id,
+            project_team_email=team_email,
+            additional_emails=add_emails,
+            notification_enabled=notif_enabled,
+            user=user
+        )
+        if not res.get("success"):
+            return jsonify(res), 400
+        return jsonify(res), 200
+
+@server.route("/api/alerts", methods=["GET"])
+def api_get_alerts():
+    status = request.args.get("status", "All")
+    severity = request.args.get("severity", "All")
+    project = request.args.get("project", "All")
+    dataset = request.args.get("dataset", "All")
+    search = request.args.get("search", "")
+    data = db_adapter.get_alerts_data(
+        status_filter=status,
+        severity_filter=severity,
+        project_filter=project,
+        dataset_filter=dataset,
+        search=search
+    )
+    df = data.get("alerts_table")
+    records = df.to_dict(orient="records") if df is not None else []
+    return jsonify({
+        "total_count": data.get("total_count", len(records)),
+        "critical_count": data.get("critical_count", 0),
+        "high_count": data.get("high_count", 0),
+        "active_count": data.get("active_count", 0),
+        "alerts": records
+    }), 200
+
+@server.route("/api/alerts/<int:alert_id>/acknowledge", methods=["POST"])
+def api_acknowledge_alert(alert_id):
+    data = request.get_json(silent=True) or {}
+    user = data.get("user", "api_user")
+    ok = db_adapter.acknowledge_alert(alert_id, user=user)
+    if not ok:
+        return jsonify({"success": False, "error": f"Alert #{alert_id} acknowledge failed"}), 400
+    return jsonify({"success": True, "alert_id": alert_id, "status": "Acknowledged"}), 200
+
+@server.route("/api/alerts/<int:alert_id>/close", methods=["POST"])
+def api_close_alert(alert_id):
+    data = request.get_json(silent=True) or {}
+    user = data.get("user", "api_user")
+    ok = db_adapter.close_alert(alert_id, user=user)
+    if not ok:
+        return jsonify({"success": False, "error": f"Alert #{alert_id} close failed"}), 400
+    return jsonify({"success": True, "alert_id": alert_id, "status": "Closed"}), 200
+
+@server.route("/api/notifications/logs", methods=["GET"])
+def api_notification_logs():
+    project_id = request.args.get("project_id", type=int)
+    execution_id = request.args.get("execution_id")
+    limit = request.args.get("limit", default=50, type=int)
+    logs_df = db_adapter.get_email_notification_logs(project_id=project_id, execution_id=execution_id, limit=limit)
+    records = logs_df.to_dict(orient="records") if logs_df is not None else []
+    return jsonify({"count": len(records), "logs": records}), 200
 
 # -------------------------------------------------------------
 # APPLICATION ENTRYPOINT
 # -------------------------------------------------------------
 
 if __name__ == "__main__":
+    try:
+        scheduler_service.start_scheduler_daemon()
+        print("[DQ-Scheduler] Background persistent scheduler daemon activated.")
+    except Exception as e:
+        print(f"[DQ-Scheduler] Daemon start notice: {e}")
+    try:
+        email_service.notification_queue.start()
+        print("[DQ-NotificationQueue] Background email notification queue activated.")
+    except Exception as e:
+        print(f"[DQ-NotificationQueue] Queue start notice: {e}")
     port = int(os.environ.get("DATABRICKS_APP_PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=False)

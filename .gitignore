@@ -16,6 +16,9 @@ venv.bak/
 .env
 *.env
 !.env.example
+.databricks_connection*.json
+.databrickscfg
+*.token
 
 # Local SQLite databases & runtime data
 *.db

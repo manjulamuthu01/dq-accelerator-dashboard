@@ -32,9 +32,12 @@ _ACTIVE_CANCELLATION_EVENTS: Dict[str, threading.Event] = {}
 # Export Unity Catalog Discovery Services
 get_databricks_connection_info = ucs.get_connection_info
 connect_databricks_workspace = ucs.connect_workspace
+disconnect_databricks_workspace = ucs.disconnect_workspace
+verify_databricks_connection = ucs.verify_connection
 get_unity_catalogs = ucs.list_catalogs
 get_unity_schemas = ucs.list_schemas
 get_unity_tables = ucs.list_tables
+get_unity_volumes = ucs.list_volumes
 get_unity_table_metadata = ucs.get_table_metadata
 test_unity_catalog_connectivity = ucs.test_unity_catalog_connectivity
 
@@ -100,6 +103,7 @@ def _init_local_db():
         project_id INTEGER PRIMARY KEY AUTOINCREMENT,
         project_name TEXT UNIQUE NOT NULL,
         description TEXT,
+        business_domain TEXT,
         catalog_name TEXT DEFAULT 'hospital_catalog',
         schema_name TEXT DEFAULT 'healthcare',
         active BOOLEAN DEFAULT 1,
@@ -116,6 +120,8 @@ def _init_local_db():
         source_table TEXT NOT NULL,
         target_table TEXT NOT NULL,
         business_key TEXT NOT NULL,
+        description TEXT,
+        connectivity_status TEXT DEFAULT 'Verified',
         active BOOLEAN DEFAULT 1,
         created_at TEXT,
         updated_at TEXT,
@@ -165,6 +171,7 @@ def _init_local_db():
         failed INTEGER DEFAULT 0,
         errored INTEGER DEFAULT 0,
         overall_status TEXT DEFAULT 'PASS',
+        dq_status TEXT DEFAULT 'IDLE',
         dq_score REAL DEFAULT 100.0,
         started_at TEXT,
         ended_at TEXT,
@@ -280,12 +287,13 @@ def _init_local_db():
     """)
 
     # Project & Dataset Schema Migrations
-    try:
-        cur.execute("SELECT owner FROM dq_project_config LIMIT 1")
-    except Exception:
-        cur.execute("ALTER TABLE dq_project_config ADD COLUMN owner TEXT DEFAULT 'Data Engineering Team'")
+    for col, ctype in [("owner", "TEXT DEFAULT 'Data Engineering Team'"), ("business_domain", "TEXT")]:
+        try:
+            cur.execute(f"SELECT {col} FROM dq_project_config LIMIT 1")
+        except Exception:
+            cur.execute(f"ALTER TABLE dq_project_config ADD COLUMN {col} {ctype}")
 
-    for col in ["source_catalog", "source_schema", "target_catalog", "target_schema"]:
+    for col in ["source_catalog", "source_schema", "target_catalog", "target_schema", "description", "connectivity_status"]:
         try:
             cur.execute(f"SELECT {col} FROM dq_table_config LIMIT 1")
         except Exception:
@@ -524,6 +532,7 @@ def _init_local_db():
 
     # Migrations for dq_execution_summary
     for col, ctype in [
+        ("dq_status", "TEXT DEFAULT 'IDLE'"),
         ("trigger_type", "TEXT DEFAULT 'MANUAL'"),
         ("records_processed", "INTEGER DEFAULT 0"),
         ("concurrency_limit", "INTEGER DEFAULT 4"),
@@ -538,6 +547,11 @@ def _init_local_db():
             cur.execute(f"ALTER TABLE dq_execution_summary ADD COLUMN {col} {ctype}")
         except Exception:
             pass
+
+    try:
+        cur.execute("UPDATE dq_execution_summary SET dq_status = overall_status WHERE dq_status IS NULL OR dq_status = 'IDLE'")
+    except Exception:
+        pass
 
     # Migrations for dq_results
     for col, ctype in [
@@ -730,8 +744,16 @@ def query_df(query: str, params: tuple = ()) -> pd.DataFrame:
     finally:
         conn.close()
 
+_LAST_DB_ERROR: Optional[str] = None
+
+def get_last_db_error() -> Optional[str]:
+    global _LAST_DB_ERROR
+    return _LAST_DB_ERROR
+
 def execute_cmd(query: str, params: tuple = ()) -> bool:
     """Executes an INSERT, UPDATE, or DELETE statement."""
+    global _LAST_DB_ERROR
+    _LAST_DB_ERROR = None
     mode = get_db_mode()
     if mode == "DATABRICKS" and _DATABRICKS_CONN:
         try:
@@ -748,6 +770,7 @@ def execute_cmd(query: str, params: tuple = ()) -> bool:
         conn.commit()
         return True
     except Exception as e:
+        _LAST_DB_ERROR = str(e)
         print(f"[DQ-Adapter] Local command failed: {e}")
         return False
     finally:
@@ -1769,7 +1792,9 @@ def add_new_project_with_dataset(
     """, (p_name, desc, p_owner, p_dom, src_cat, src_sch, 1 if active else 0, clean_t[0], ", ".join(clean_addl), all_notif_emails, 1 if notification_enabled else 0, now, now))
 
     if not proj_success:
-        return {"success": False, "message": "Failed to insert into dq_project_config."}
+        err = get_last_db_error()
+        msg = f"Failed to insert into dq_project_config: {err}" if err else "Failed to insert into dq_project_config."
+        return {"success": False, "message": msg}
 
     p_row = query_df("SELECT project_id FROM dq_project_config WHERE project_name = ?", (p_name,))
     if p_row.empty:
@@ -1785,7 +1810,9 @@ def add_new_project_with_dataset(
     """, (p_id, ds_final_name, src_cat, src_sch, src_tbl, tgt_cat, tgt_sch, tgt_tbl, b_key, 1 if active else 0, now, now))
 
     if not ds_success:
-        return {"success": False, "message": "Project created, but failed to register dataset in dq_table_config."}
+        err = get_last_db_error()
+        msg = f"Project created, but failed to register dataset: {err}" if err else "Project created, but failed to register dataset in dq_table_config."
+        return {"success": False, "message": msg}
 
     d_row = query_df("SELECT dataset_id FROM dq_table_config WHERE project_id = ? AND dataset_name = ?", (p_id, ds_final_name))
     d_id = int(d_row.iloc[0]["dataset_id"]) if not d_row.empty else p_id
@@ -2414,9 +2441,9 @@ def trigger_validation(project_name: str, dataset_name: str, run_type: str = "MA
     execute_cmd("""
         INSERT OR REPLACE INTO dq_execution_summary
         (execution_id, project_name, dataset_name, total_rules, passed, failed, errored,
-         overall_status, dq_score, started_at, trigger_type, concurrency_limit,
+         overall_status, dq_status, dq_score, started_at, trigger_type, concurrency_limit,
          rules_queued, rules_running, retry_of_execution_id, schedule_id)
-        VALUES (?, ?, ?, ?, 0, 0, 0, 'RUNNING', 0.0, ?, ?, ?, ?, 0, ?, ?)
+        VALUES (?, ?, ?, ?, 0, 0, 0, 'RUNNING', 'RUNNING', 0.0, ?, ?, ?, ?, 0, ?, ?)
     """, (exec_id, project_name, dataset_name, total_rules_count, start_str, run_type,
           max_concurrency, total_rules_count, retry_of, schedule_id))
 
@@ -2508,11 +2535,11 @@ def trigger_validation(project_name: str, dataset_name: str, run_type: str = "MA
     cancelled_at_val = end_str if overall_status == "CANCELLED" else None
     execute_cmd("""
         UPDATE dq_execution_summary
-        SET total_rules = ?, passed = ?, failed = ?, errored = ?, overall_status = ?,
+        SET total_rules = ?, passed = ?, failed = ?, errored = ?, overall_status = ?, dq_status = ?,
             dq_score = ?, ended_at = ?, duration_ms = ?, rules_queued = 0, rules_running = 0,
             cancelled_at = ?
         WHERE execution_id = ?
-    """, (total, passed, failed, errored, overall_status, dq_score, end_str,
+    """, (total, passed, failed, errored, overall_status, overall_status, dq_score, end_str,
           total_duration_ms, cancelled_at_val, exec_id))
 
     # Update execution queue record
@@ -2690,7 +2717,8 @@ def get_execution_history(project_name: Optional[str] = None, dataset_name: Opti
     """
     sql = """
     SELECT execution_id, project_name, dataset_name, total_rules, passed, failed, errored,
-           overall_status, dq_score, started_at, ended_at, duration_ms, dq_status,
+           overall_status, dq_score, started_at, ended_at, duration_ms,
+           COALESCE(dq_status, overall_status) AS dq_status,
            COALESCE(trigger_type, 'MANUAL') AS trigger_type,
            concurrency_limit, schedule_id, retry_of_execution_id, cancelled_at
     FROM dq_execution_summary
@@ -2762,7 +2790,7 @@ def cancel_execution(execution_id: str, user: str = "admin") -> Dict[str, Any]:
 
     execute_cmd("""
         UPDATE dq_execution_summary
-        SET overall_status = 'CANCELLED', cancelled_at = ?, ended_at = ?,
+        SET overall_status = 'CANCELLED', dq_status = 'CANCELLED', cancelled_at = ?, ended_at = ?,
             rules_queued = 0, rules_running = 0
         WHERE execution_id = ?
     """, (now_str, now_str, execution_id))
@@ -3085,7 +3113,7 @@ def run_schedule_now(schedule_id: int, user: str = "admin") -> Dict[str, Any]:
 
     log_config_audit("SCHEDULE", str(schedule_id), "RUN_NOW", None, {"triggered_by": user}, user)
 
-    return trigger_validation(
+    res = trigger_validation(
         project_name=p_name,
         dataset_name=d_name,
         run_type="MANUAL",
@@ -3094,6 +3122,20 @@ def run_schedule_now(schedule_id: int, user: str = "admin") -> Dict[str, Any]:
         rules_mode=rules_mode,
         selected_rule_ids=sel_rules
     )
+
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    exec_id = res.get("execution_id")
+    st = res.get("status", "PASS")
+    execute_cmd("""
+        UPDATE dq_schedules
+        SET last_run_at = ?,
+            last_status = ?,
+            last_execution_id = ?,
+            updated_at = ?
+        WHERE schedule_id = ?
+    """, (now_str, st, exec_id, now_str, schedule_id))
+
+    return res
 
 
 def get_job_runs(limit: int = 10) -> pd.DataFrame:
@@ -4349,10 +4391,13 @@ def register_uploaded_dataset(
         "dataset_id": dataset_id,
         "dataset_name": ds_name,
         "full_table_name": full_src_table,
+        "target_table_name": full_tgt_table,
         "total_records": len(df),
         "columns": list(df.columns),
         "schema_info": parsed["schema_info"],
         "business_key": b_key,
+        "registered_at": now,
+        "connection_status": "Active (Local Storage)",
     }
 
 

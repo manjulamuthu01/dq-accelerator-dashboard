@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS dq_project_config (
     project_name STRING NOT NULL,
     description STRING,
     owner STRING DEFAULT 'Data Engineering Team',
+    business_domain STRING,
     catalog_name STRING DEFAULT 'hospital_catalog',
     schema_name STRING DEFAULT 'healthcare',
     active BOOLEAN DEFAULT true,
@@ -33,6 +34,8 @@ CREATE TABLE IF NOT EXISTS dq_table_config (
     target_schema STRING DEFAULT 'healthcare',
     target_table STRING,
     business_key STRING,
+    description STRING,
+    connectivity_status STRING DEFAULT 'Verified',
     active BOOLEAN DEFAULT true,
     created_at TIMESTAMP,
     updated_at TIMESTAMP,
@@ -115,6 +118,7 @@ CREATE TABLE IF NOT EXISTS dq_execution_summary (
     ended_at TIMESTAMP,
     duration_ms BIGINT DEFAULT 0,
     overall_status STRING DEFAULT 'PASS',
+    dq_status STRING DEFAULT 'IDLE',
     dq_score DOUBLE DEFAULT 100.0,
     CONSTRAINT uq_exec_summary UNIQUE (execution_id, dataset_name)
 );

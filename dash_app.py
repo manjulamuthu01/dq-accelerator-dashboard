@@ -5,13 +5,17 @@ Clean enterprise layout, zero emojis, Bootstrap Icons, real database actions.
 """
 
 import os
+import time
 import json
+import logging
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Union
 from flask import request, jsonify
+
+logger = logging.getLogger("dash_app")
 
 import dash
 from dash import Dash, html, dcc, Input, Output, State, ctx, dash_table
@@ -446,6 +450,7 @@ app.index_string = """<!DOCTYPE html>
 
 SIDEBAR_NAV = [
     ("overview", "Overview", "bi bi-speedometer2"),
+    ("connection", "Databricks Connection", "bi bi-clouds"),
     ("management", "Projects & Datasets", "bi bi-layers"),
     ("rules", "Rule Library", "bi bi-book"),
     ("execution", "Execution & Monitoring", "bi bi-play-circle"),
@@ -454,6 +459,23 @@ SIDEBAR_NAV = [
     ("alerts", "Alerts & Reports", "bi bi-bell"),
     ("audit", "Audit History", "bi bi-clock-history"),
 ]
+
+def _render_sidebar_connection_status():
+    try:
+        info = db_adapter.get_databricks_connection_info()
+        if info.get("connected"):
+            h = info.get("clean_host") or "Connected"
+            return dcc.Link([
+                html.I(className="bi bi-circle-fill text-success me-2", style={"fontSize": "0.55rem"}),
+                html.Span(h, className="text-truncate", style={"maxWidth": "130px", "fontSize": "0.78rem", "color": "#10B981"}),
+            ], href="/connection", className="d-flex align-items-center text-decoration-none p-1 px-2 rounded mb-2", style={"backgroundColor": "#0F172A", "border": "1px solid #1E293B"}, title=f"Connected to {info.get('host')}")
+        else:
+            return dcc.Link([
+                html.I(className="bi bi-circle text-warning me-2", style={"fontSize": "0.55rem"}),
+                html.Span("Connect Databricks", style={"fontSize": "0.78rem", "color": "#F59E0B"}),
+            ], href="/connection", className="d-flex align-items-center text-decoration-none p-1 px-2 rounded mb-2", style={"backgroundColor": "#0F172A", "border": "1px solid rgba(245, 158, 11, 0.3)"}, title="Databricks Disconnected. Click to connect workspace.")
+    except Exception:
+        return html.Div()
 
 def render_sidebar():
     return html.Div([
@@ -474,8 +496,11 @@ def render_sidebar():
             ], vertical=True, pills=True),
         ]),
         html.Div([
-            html.Div(className="status-dot"),
-            html.Span("Running", style={"fontWeight": "500", "color": "#10B981"}),
+            html.Div(id="sidebar-connection-status", children=_render_sidebar_connection_status()),
+            html.Div([
+                html.Div(className="status-dot"),
+                html.Span("Running", style={"fontWeight": "500", "color": "#10B981"}),
+            ], className="d-flex align-items-center"),
         ], className="sidebar-footer"),
     ], className="sidebar")
 
@@ -490,6 +515,9 @@ app.layout = html.Div([
     dcc.Store(id="project-refresh-store", data=""),
     # Store that triggers a live refresh of the alerts table/KPIs after Acknowledge/Close.
     dcc.Store(id="alert-refresh-store", data=""),
+    # Store for Databricks connection state updates
+    dcc.Store(id="connection-refresh-store", data=""),
+    dcc.Store(id="session-user-id", storage_type="local", data="default_user"),
     # Execution & Monitoring store lives in the root layout so the latest run
     # survives page navigation. The polling dcc.Interval lives on the Execution
     # page itself so it never fires while its output components are unmounted.
@@ -530,7 +558,9 @@ def _get_initial_catalog_options():
         return []
 
 
-def _get_initial_schema_options(cat="hospital_catalog"):
+def _get_initial_schema_options(cat=None):
+    if not cat:
+        return []
     try:
         schemas = db_adapter.get_unity_schemas(cat)
         opts = []
@@ -543,7 +573,9 @@ def _get_initial_schema_options(cat="hospital_catalog"):
         return []
 
 
-def _get_initial_table_options(cat="hospital_catalog", sch="healthcare"):
+def _get_initial_table_options(cat=None, sch=None):
+    if not cat or not sch:
+        return []
     try:
         tables = db_adapter.get_unity_tables(cat, sch)
         opts = []
@@ -556,7 +588,9 @@ def _get_initial_table_options(cat="hospital_catalog", sch="healthcare"):
         return []
 
 
-def _get_initial_bkey_options(cat="hospital_catalog", sch="healthcare", tbl="source_table"):
+def _get_initial_bkey_options(cat=None, sch=None, tbl=None):
+    if not cat or not sch or not tbl:
+        return []
     try:
         meta = db_adapter.get_unity_table_metadata(cat, sch, tbl)
         cols = meta.get("columns", [])
@@ -650,10 +684,74 @@ def _build_table_preview_card(meta: dict):
 
 def _get_initial_table_preview():
     try:
-        meta = db_adapter.get_unity_table_metadata("hospital_catalog", "healthcare", "source_table")
+        cats = db_adapter.get_unity_catalogs()
+        if not cats:
+            return html.Div()
+        cat = cats[0]["name"] if isinstance(cats[0], dict) else str(cats[0])
+        schemas = db_adapter.get_unity_schemas(cat)
+        if not schemas:
+            return html.Div()
+        sch = schemas[0]["name"] if isinstance(schemas[0], dict) else str(schemas[0])
+        tables = db_adapter.get_unity_tables(cat, sch)
+        if not tables:
+            return html.Div()
+        tbl = tables[0]["name"] if isinstance(tables[0], dict) else str(tables[0])
+        meta = db_adapter.get_unity_table_metadata(cat, sch, tbl)
         return _build_table_preview_card(meta)
     except Exception:
         return html.Div()
+
+
+def _render_modal_connection_bar():
+    """Renders the workspace connection status bar inside the Register Dataset modal."""
+    try:
+        from accelerator.databricks_connection import get_connection_manager
+        sess = get_connection_manager().get_session()
+        is_conn = bool(sess and (getattr(sess, "connected", False) or getattr(sess, "is_connected", False)))
+    except Exception:
+        sess = None
+        is_conn = False
+
+    if is_conn and sess:
+        host_disp = getattr(sess, "host", "") or "Databricks Workspace"
+        auth_type_disp = getattr(sess, "auth_type", "Connected")
+        user_name_disp = getattr(sess, "user_name", "") or (sess.user_info.get("user_name") if hasattr(sess, "user_info") else "") or "Authenticated"
+        return html.Div([
+            html.Div([
+                html.Span(html.I(className="bi bi-circle-fill text-success me-2", style={"fontSize": "0.65rem"})),
+                html.Span("Connected Workspace: ", className="small fw-semibold text-secondary me-1"),
+                html.Code(host_disp, id="workspace-connected-host", className="text-primary fw-bold"),
+                html.Span(f" ({auth_type_disp} - {user_name_disp})", id="workspace-connected-auth", className="text-muted small ms-2"),
+            ], className="d-flex align-items-center"),
+            dcc.Link([
+                html.I(className="bi bi-box-arrow-up-right me-1"),
+                "Manage Connection"
+            ], href="/connection", className="small fw-semibold text-decoration-none"),
+        ], className="d-flex justify-content-between align-items-center p-2 px-3 border rounded bg-white shadow-sm mb-3")
+    else:
+        return html.Div([
+            dbc.Alert([
+                html.Div([
+                    html.I(className="bi bi-exclamation-triangle-fill text-warning me-2 fs-5"),
+                    html.Div([
+                        html.Span("No Databricks Workspace Connected. ", className="fw-bold"),
+                        html.Span("Connect your Databricks workspace to dynamically discover catalogs, schemas, and Delta tables."),
+                    ], className="d-inline-block small"),
+                ], className="d-flex align-items-center"),
+                html.Div([
+                    dcc.Link(
+                        dbc.Button([
+                            html.I(className="bi bi-clouds me-1"),
+                            "Connect Databricks Workspace"
+                        ], color="warning", size="sm", className="rounded-pill fw-semibold"),
+                        href="/connection",
+                    ),
+                ], className="d-flex justify-content-end mt-2"),
+            ], color="warning", className="mb-3 py-2 px-3 border"),
+            # Fallback hidden elements for ID safety
+            html.Code("Not connected", id="workspace-connected-host", style={"display": "none"}),
+            html.Span("", id="workspace-connected-auth", style={"display": "none"}),
+        ])
 
 
 def _real_click() -> bool:
@@ -1271,11 +1369,11 @@ def page_management():
                             dbc.Row([
                                 dbc.Col([
                                     dbc.Label(["Destination Catalog ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
-                                    dbc.Input(id="input-upload-catalog", placeholder="insurance_catalog", value="hospital_catalog", type="text", className="rounded-pill px-3 py-2"),
+                                    dbc.Input(id="input-upload-catalog", placeholder="e.g. dq_catalog", value="", type="text", className="rounded-pill px-3 py-2"),
                                 ], md=4, className="mb-3"),
                                 dbc.Col([
                                     dbc.Label(["Destination Schema ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
-                                    dbc.Input(id="input-upload-schema", placeholder="claims", value="healthcare", type="text", className="rounded-pill px-3 py-2"),
+                                    dbc.Input(id="input-upload-schema", placeholder="e.g. dq_testing", value="", type="text", className="rounded-pill px-3 py-2"),
                                 ], md=4, className="mb-3"),
                                 dbc.Col([
                                     dbc.Label(["Table Name ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
@@ -1305,41 +1403,7 @@ def page_management():
                     # ── OPTION 2: EXISTING DATABRICKS TABLE WORKFLOW ──────────────
                     html.Div(id="container-existing-dataset", style={"display": "none"}, children=[
                         # 1. Databricks Authentication & Workspace Connection Bar
-                        html.Div([
-                            html.Div([
-                                html.Div([
-                                    html.Span(html.I(className="bi bi-circle-fill text-success me-2", style={"fontSize": "0.65rem"})),
-                                    html.Span("Connected Workspace: ", className="small fw-semibold text-secondary me-1"),
-                                    html.Code("dbc-9f225403-7c26.cloud.databricks.com", id="workspace-connected-host", className="text-primary fw-bold"),
-                                    html.Span(" (Unity Catalog Active)", id="workspace-connected-auth", className="text-muted small ms-2"),
-                                ], className="d-flex align-items-center"),
-                                dbc.Button([
-                                    html.I(className="bi bi-shield-lock-fill me-1"),
-                                    "Workspace Auth Settings"
-                                ], id="btn-toggle-workspace-settings", color="link", size="sm", className="p-0 text-decoration-none small fw-semibold"),
-                            ], className="d-flex justify-content-between align-items-center p-2 px-3 border rounded bg-white shadow-sm mb-3"),
-                            
-                            dbc.Collapse(
-                                id="collapse-workspace-settings",
-                                is_open=False,
-                                children=html.Div([
-                                    dbc.Row([
-                                        dbc.Col([
-                                            dbc.Label("Databricks Workspace Host URL", className="small fw-semibold text-secondary mb-1"),
-                                            dbc.Input(id="input-workspace-host", value="https://dbc-9f225403-7c26.cloud.databricks.com", type="text", className="rounded-pill px-3 py-1 small"),
-                                        ], md=6, className="mb-2"),
-                                        dbc.Col([
-                                            dbc.Label("Personal Access Token / Secret (Optional for OAuth)", className="small fw-semibold text-secondary mb-1"),
-                                            dbc.Input(id="input-workspace-token", placeholder="Leave blank to use workspace OAuth identity", type="password", className="rounded-pill px-3 py-1 small"),
-                                        ], md=4, className="mb-2"),
-                                        dbc.Col([
-                                            dbc.Button("Authenticate", id="btn-connect-workspace", color="primary", size="sm", className="rounded-pill w-100 fw-semibold mt-4"),
-                                        ], md=2, className="mb-2"),
-                                    ]),
-                                    html.Div(id="workspace-connect-alert", className="mt-1 small"),
-                                ], className="p-3 bg-light border rounded mb-3"),
-                            ),
-                        ]),
+                        html.Div(id="modal-connection-bar-container", children=_render_modal_connection_bar()),
 
                         # 2. Dynamic Unity Catalog Hierarchy Dropdowns (Catalog -> Schema -> Table)
                         html.Div("DYNAMIC UNITY CATALOG TABLE DISCOVERY", className="fw-bold text-muted small mb-2", style={"letterSpacing": "0.05em"}),
@@ -1352,7 +1416,7 @@ def page_management():
                                 dbc.Select(
                                     id="select-existing-catalog",
                                     options=_get_initial_catalog_options(),
-                                    value="hospital_catalog",
+                                    value=None,
                                     placeholder="Select Catalog...",
                                     className="rounded-pill px-3 py-2",
                                 ),
@@ -1364,8 +1428,8 @@ def page_management():
                                 ]),
                                 dbc.Select(
                                     id="select-existing-schema",
-                                    options=_get_initial_schema_options(),
-                                    value="healthcare",
+                                    options=[],
+                                    value=None,
                                     placeholder="Select Schema...",
                                     className="rounded-pill px-3 py-2",
                                 ),
@@ -1377,8 +1441,8 @@ def page_management():
                                 ]),
                                 dbc.Select(
                                     id="select-existing-table",
-                                    options=_get_initial_table_options(),
-                                    value="source_table",
+                                    options=[],
+                                    value=None,
                                     placeholder="Select Table...",
                                     className="rounded-pill px-3 py-2",
                                 ),
@@ -1389,14 +1453,14 @@ def page_management():
                         dbc.Row([
                             dbc.Col([
                                 dbc.Label(["Dataset Name ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
-                                dbc.Input(id="input-existing-dataset-name", value="source_table", placeholder="e.g. Transactions_Master", type="text", className="rounded-pill px-3 py-2"),
+                                dbc.Input(id="input-existing-dataset-name", value="", placeholder="e.g. Transactions_Master", type="text", className="rounded-pill px-3 py-2"),
                             ], md=6, className="mb-3"),
                             dbc.Col([
                                 dbc.Label(["Business Key Column ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
                                 dbc.Select(
                                     id="select-existing-business-key",
-                                    options=_get_initial_bkey_options(),
-                                    value="patient_id",
+                                    options=[],
+                                    value=None,
                                     placeholder="Select Business Key from table columns...",
                                     className="rounded-pill px-3 py-2",
                                 ),
@@ -1404,7 +1468,7 @@ def page_management():
                         ]),
 
                         # 4. Table Preview & Detected Metadata Container
-                        html.Div(id="existing-table-preview-container", children=_get_initial_table_preview(), className="mb-3"),
+                        html.Div(id="existing-table-preview-container", children=html.Div(), className="mb-3"),
 
                         # 5. Optional Source-to-Target Reconciliation Section
                         html.Div([
@@ -1421,21 +1485,21 @@ def page_management():
                                     dbc.Row([
                                         dbc.Col([
                                             dbc.Label("Target Catalog", className="small fw-semibold text-secondary mb-1"),
-                                            dbc.Select(id="select-existing-target-catalog", options=_get_initial_catalog_options(), value="hospital_catalog", placeholder="Select Target Catalog...", className="rounded-pill px-3 py-2"),
+                                            dbc.Select(id="select-existing-target-catalog", options=_get_initial_catalog_options(), value=None, placeholder="Select Target Catalog...", className="rounded-pill px-3 py-2"),
                                         ], md=4, className="mb-2"),
                                         dbc.Col([
                                             dbc.Label("Target Schema", className="small fw-semibold text-secondary mb-1"),
-                                            dbc.Select(id="select-existing-target-schema", options=_get_initial_schema_options(), value="healthcare", placeholder="Select Target Schema...", className="rounded-pill px-3 py-2"),
+                                            dbc.Select(id="select-existing-target-schema", options=[], value=None, placeholder="Select Target Schema...", className="rounded-pill px-3 py-2"),
                                         ], md=4, className="mb-2"),
                                         dbc.Col([
                                             dbc.Label("Target Table", className="small fw-semibold text-secondary mb-1"),
-                                            dbc.Select(id="select-existing-target-table", options=_get_initial_table_options(), value="patients_target", placeholder="Select Target Table...", className="rounded-pill px-3 py-2"),
+                                            dbc.Select(id="select-existing-target-table", options=[], value=None, placeholder="Select Target Table...", className="rounded-pill px-3 py-2"),
                                         ], md=4, className="mb-2"),
                                     ]),
                                     dbc.Row([
                                         dbc.Col([
                                             dbc.Label("Target Business Key (Optional)", className="small fw-semibold text-secondary mb-1"),
-                                            dbc.Select(id="select-existing-target-bkey", options=_get_initial_bkey_options(tbl="patients_target"), value="patient_id", placeholder="Select Target Business Key...", className="rounded-pill px-3 py-2"),
+                                            dbc.Select(id="select-existing-target-bkey", options=[], value=None, placeholder="Select Target Business Key...", className="rounded-pill px-3 py-2"),
                                         ], md=6, className="mb-2"),
                                     ]),
                                 ], className="p-3 bg-light border rounded mb-3"),
@@ -2071,6 +2135,7 @@ def page_execution():
     return html.Div([
         # Polling Interval — mounted whenever on Execution page
         dcc.Interval(id="exec-interval", interval=1500, n_intervals=0, disabled=True),
+        dcc.Interval(id="sched-auto-refresh-interval", interval=4000, n_intervals=0),
         dcc.Download(id="exec-download-csv"),
         dcc.Store(id="exec-selected-rules-store", data=[]),
 
@@ -2218,7 +2283,7 @@ def page_execution():
                                 {"label": "Asia/Kolkata (IST)", "value": "Asia/Kolkata"},
                                 {"label": "Asia/Singapore (SGT)", "value": "Asia/Singapore"},
                             ],
-                            value="UTC",
+                            value="Asia/Kolkata",
                             size="sm",
                         ),
                     ], md=4, className="mb-2"),
@@ -3331,6 +3396,311 @@ def page_audit():
         ], id="modal-audit-detail", is_open=False, size="lg"),
     ])
 
+
+def _render_volumes_list(volumes, cat, sch):
+    if not volumes:
+        return html.Div()
+    pills = []
+    for v in volumes:
+        v_name = v.get("name", "")
+        v_path = v.get("full_name") or f"/Volumes/{cat}/{sch}/{v_name}"
+        pills.append(html.Span([
+            html.I(className="bi bi-folder2-open text-warning me-1"),
+            html.Span(v_name, className="fw-bold me-1"),
+            html.Span(f"({v_path})", className="text-muted small"),
+        ], className="badge bg-light text-dark border me-2 mb-2 p-2"))
+    return html.Div([
+        html.Div("DISCOVERED UNITY CATALOG VOLUMES", className="fw-bold text-muted small mb-2", style={"letterSpacing": "0.05em"}),
+        html.Div(pills, className="d-flex flex-wrap p-2 bg-light rounded border"),
+    ])
+
+
+def _render_explorer_table_metadata(cat, sch, tbl):
+    if not cat or not sch or not tbl:
+        return html.Div()
+    try:
+        meta = db_adapter.get_unity_table_metadata(cat, sch, tbl)
+        cols = meta.get("columns", [])
+        types = {s.get("column"): s.get("sql_type", "STRING") for s in meta.get("schema_info", [])}
+        b_cands = meta.get("business_key_candidates", [])
+        col_badges = [
+            html.Span([
+                html.Span(c, className="fw-semibold me-1"),
+                html.Span(types.get(c, "STRING"), className="badge bg-primary text-white me-1", style={"fontSize": "0.65rem"}),
+                html.Span("[Key Candidate]", className="badge bg-success-subtle text-success border border-success", style={"fontSize": "0.65rem"}) if c in b_cands else None
+            ], className="badge bg-light text-dark border me-2 mb-2 p-2")
+            for c in cols
+        ]
+        return html.Div([
+            html.Div([
+                html.Div(f"TABLE METADATA: {cat}.{sch}.{tbl}", className="fw-bold text-muted small", style={"letterSpacing": "0.05em"}),
+                dcc.Link([
+                    html.I(className="bi bi-plus-circle-fill me-1"),
+                    "Register as DQ Dataset"
+                ], href="/management", className="btn btn-sm btn-outline-primary py-0 px-2 fw-semibold small text-decoration-none"),
+            ], className="d-flex justify-content-between align-items-center mb-2"),
+            html.Div([
+                html.Div(f"Detected Columns ({len(cols)}):", className="small fw-semibold text-secondary mb-2"),
+                html.Div(col_badges, className="d-flex flex-wrap"),
+            ], className="p-3 bg-white border rounded"),
+        ])
+    except Exception as e:
+        return html.Div(f"Error inspecting table metadata: {e}", className="text-muted small")
+
+
+def page_connection():
+    conn_info = db_adapter.get_databricks_connection_info()
+    is_connected = conn_info.get("connected", False)
+    clean_host = conn_info.get("clean_host", "")
+    full_host = conn_info.get("host", "")
+    username = conn_info.get("username", "")
+    display_name = conn_info.get("display_name", "")
+    auth_type = conn_info.get("auth_type", "OAuth U2M")
+    ws_id = conn_info.get("workspace_id", "")
+    cloud_prov = conn_info.get("cloud_provider", "Databricks Cloud")
+    catalogs_count = conn_info.get("catalogs_count", 0)
+
+    # Status badge
+    if is_connected:
+        status_badge = html.Span([
+            html.I(className="bi bi-circle-fill text-success me-1", style={"fontSize": "0.65rem"}),
+            "Connected"
+        ], className="badge bg-success-subtle text-success border border-success px-3 py-2 fw-semibold")
+    else:
+        status_badge = html.Span([
+            html.I(className="bi bi-circle text-secondary me-1", style={"fontSize": "0.65rem"}),
+            "Disconnected"
+        ], className="badge bg-secondary-subtle text-secondary border px-3 py-2 fw-semibold")
+
+    # Header Bar
+    header = html.Div([
+        html.Div([
+            html.H3([html.I(className="bi bi-clouds text-primary me-2"), "Databricks Workspace Connection"],
+                    className="page-main-title"),
+            html.Div("Connect your personal or enterprise Databricks workspace using OAuth, CLI Profile, or PAT. Dynamic Unity Catalog resource discovery without hardcoding.",
+                     className="text-muted small"),
+        ]),
+        html.Div([
+            dbc.Button([html.I(className="bi bi-shield-check me-1"), "Verify Connection"],
+                       id="btn-conn-verify", size="sm", color="outline-primary", className="me-2 rounded-pill px-3 fw-semibold",
+                       disabled=not is_connected),
+            dbc.Button([html.I(className="bi bi-arrow-clockwise me-1"), "Refresh Discovery"],
+                       id="btn-conn-refresh-discovery", size="sm", color="outline-secondary", className="me-2 rounded-pill px-3 fw-semibold",
+                       disabled=not is_connected),
+            dbc.Button([html.I(className="bi bi-power me-1"), "Disconnect"],
+                       id="btn-conn-disconnect", size="sm", color="outline-danger", className="rounded-pill px-3 fw-semibold",
+                       disabled=not is_connected),
+        ], className="d-flex align-items-center"),
+    ], className="page-header-bar")
+
+    # 4 KPI Summary Cards
+    kpi_cards = dbc.Row([
+        dbc.Col(html.Div([
+            html.Div("Connection Status", className="text-muted small fw-semibold mb-1"),
+            html.Div([
+                status_badge,
+                html.Span(clean_host if is_connected else "No Workspace", className="ms-2 fw-bold text-dark small text-truncate", style={"maxWidth": "160px"}),
+            ], className="d-flex align-items-center"),
+            html.Div(f"Org / Workspace ID: {ws_id}" if ws_id else cloud_prov, className="text-muted small mt-1", style={"fontSize": "0.75rem"}),
+        ], className="dq-card p-3 h-100"), md=3, className="mb-3"),
+
+        dbc.Col(html.Div([
+            html.Div("Authenticated Identity", className="text-muted small fw-semibold mb-1"),
+            html.Div([
+                html.I(className="bi bi-person-circle text-primary fs-5 me-2"),
+                html.Span(username if is_connected and username else ("Unauthenticated" if not is_connected else "Connected User"),
+                          className="fw-bold text-dark small text-truncate", style={"maxWidth": "180px"}),
+            ], className="d-flex align-items-center"),
+            html.Div(display_name if display_name else "User-Scoped Session Isolation", className="text-muted small mt-1", style={"fontSize": "0.75rem"}),
+        ], className="dq-card p-3 h-100"), md=3, className="mb-3"),
+
+        dbc.Col(html.Div([
+            html.Div("Authentication Protocol", className="text-muted small fw-semibold mb-1"),
+            html.Div([
+                html.I(className="bi bi-key-fill text-warning fs-5 me-2"),
+                html.Span(auth_type if is_connected else "None", className="fw-bold text-dark small"),
+            ], className="d-flex align-items-center"),
+            html.Div("Official Databricks SDK Unified Auth", className="text-muted small mt-1", style={"fontSize": "0.75rem"}),
+        ], className="dq-card p-3 h-100"), md=3, className="mb-3"),
+
+        dbc.Col(html.Div([
+            html.Div("Accessible Catalogs", className="text-muted small fw-semibold mb-1"),
+            html.Div([
+                html.I(className="bi bi-database-check text-info fs-5 me-2"),
+                html.Span(f"{catalogs_count} Catalog(s) Discovered" if is_connected else "0 Catalogs", className="fw-bold text-dark small"),
+            ], className="d-flex align-items-center"),
+            html.Div("Dynamic Permission-Scoped Discovery", className="text-muted small mt-1", style={"fontSize": "0.75rem"}),
+        ], className="dq-card p-3 h-100"), md=3, className="mb-3"),
+    ], className="g-3 mb-3")
+
+    # Connection Form Card
+    connection_form = html.Div([
+        html.Div([
+            html.Div([
+                html.I(className="bi bi-link-45deg text-primary me-2 fs-5"),
+                html.Span("Connect Databricks Workspace", className="fw-bold fs-6"),
+            ], className="d-flex align-items-center"),
+            html.Span("Every developer or organization authenticates with their own workspace.", className="text-muted small"),
+        ], className="d-flex justify-content-between align-items-center mb-3 pb-2 border-bottom"),
+
+        dbc.Label("Choose Authentication Mechanism *", className="small fw-semibold text-secondary mb-2"),
+        dbc.RadioItems(
+            id="conn-form-auth-type",
+            options=[
+                {"label": "Personal Access Token (PAT - Recommended for Free Edition)", "value": "PAT"},
+                {"label": "Databricks OAuth U2M (Single Sign-On)", "value": "OAUTH_U2M"},
+                {"label": "Databricks CLI Profile (~/.databrickscfg)", "value": "CLI_PROFILE"},
+            ],
+            value="PAT" if not is_connected else (auth_type if auth_type in ("PAT", "OAUTH_U2M", "CLI_PROFILE") else "PAT"),
+            inline=True,
+            className="mb-3 small fw-semibold text-dark",
+        ),
+
+        dbc.Row([
+            dbc.Col([
+                dbc.Label(["Workspace Host URL ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                dbc.Input(
+                    id="conn-form-host",
+                    placeholder="https://dbc-xxxx.cloud.databricks.com",
+                    value=clean_host if is_connected else "",
+                    type="text",
+                    className="rounded-pill px-3 py-2 small",
+                ),
+                html.Div("Example: https://dbc-9f225403-7c26.cloud.databricks.com. Query parameters (?autoLogin=...) are automatically stripped.", className="text-muted small mt-1", style={"fontSize": "0.72rem"}),
+            ], md=6, className="mb-3"),
+
+            dbc.Col([
+                html.Div(id="conn-form-profile-container", style={"display": "none"}, children=[
+                    dbc.Label("Databricks CLI Profile Name", className="small fw-semibold text-secondary mb-1"),
+                    dbc.Input(
+                        id="conn-form-profile",
+                        placeholder="DEFAULT",
+                        value="DEFAULT",
+                        type="text",
+                        className="rounded-pill px-3 py-2 small",
+                    ),
+                    html.Div("Profile defined in your local ~/.databrickscfg file.", className="text-muted small mt-1", style={"fontSize": "0.72rem"}),
+                ]),
+                html.Div(id="conn-form-token-container", style={"display": "block" if not is_connected else "none"}, children=[
+                    dbc.Label(["Personal Access Token (PAT) ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                    dbc.Input(
+                        id="conn-form-token",
+                        placeholder="dapi...",
+                        type="password",
+                        className="rounded-pill px-3 py-2 small",
+                    ),
+                    html.Div("Personal Access Token generated from User Settings → Developer. Stored in-memory only.", className="text-muted small mt-1", style={"fontSize": "0.72rem"}),
+                ]),
+            ], md=6, className="mb-3"),
+        ]),
+
+        html.Div([
+            dbc.Button([
+                html.I(className="bi bi-lightning-charge-fill me-2"),
+                "Connect to Databricks"
+            ], id="btn-conn-submit", color="primary", className="rounded-pill px-4 py-2 fw-semibold shadow-sm"),
+        ], className="d-flex justify-content-end mt-2"),
+
+        html.Div(id="conn-form-alert", className="mt-3"),
+
+        # Security Assurance Banner
+        html.Div([
+            html.Div([
+                html.I(className="bi bi-shield-lock-fill text-success me-2 fs-5"),
+                html.Span("Zero Hardcoding & Credential Isolation Architecture", className="fw-semibold small text-success"),
+            ], className="d-flex align-items-center mb-1"),
+            html.Div([
+                "• Your workspace URL and credentials are never hardcoded or committed to git.", html.Br(),
+                "• All resource queries respect your Databricks Unity Catalog permissions (USE CATALOG, USE SCHEMA, SELECT).", html.Br(),
+                "• Each user/developer has their own isolated session connection.",
+            ], className="text-muted small ps-4", style={"fontSize": "0.75rem"}),
+        ], className="p-3 bg-success-subtle border border-success-subtle rounded mt-3"),
+    ], className="dq-card p-4 mb-4")
+
+    # Dynamic Unity Catalog Resource Explorer Card
+    catalogs = db_adapter.get_unity_catalogs() if is_connected else []
+    cat_opts = [{"label": c["name"] + (f" ({c.get('type')})" if c.get('type') else ""), "value": c["name"]} for c in catalogs]
+    initial_cat = cat_opts[0]["value"] if cat_opts else None
+    initial_schemas = db_adapter.get_unity_schemas(initial_cat) if initial_cat else []
+    sch_opts = [{"label": s["name"], "value": s["name"]} for s in initial_schemas]
+    initial_sch = sch_opts[0]["value"] if sch_opts else None
+    initial_tables = db_adapter.get_unity_tables(initial_cat, initial_sch) if (initial_cat and initial_sch) else []
+    tbl_opts = [{"label": f"{t['name']} ({t.get('type', 'MANAGED')})", "value": t["name"]} for t in initial_tables]
+    initial_volumes = db_adapter.get_unity_volumes(initial_cat, initial_sch) if (initial_cat and initial_sch) else []
+
+    if is_connected:
+        explorer_content = html.Div([
+            html.Div([
+                html.Div([
+                    html.I(className="bi bi-compass-fill text-primary me-2 fs-5"),
+                    html.Span("Live Unity Catalog Resource Explorer", className="fw-bold fs-6"),
+                ], className="d-flex align-items-center"),
+                html.Span(f"Dynamically discovered from {clean_host} ({len(catalogs)} Catalogs Accessible)", className="text-muted small"),
+            ], className="d-flex justify-content-between align-items-center mb-3 pb-2 border-bottom"),
+
+            dbc.Row([
+                dbc.Col([
+                    dbc.Label("Select Catalog", className="small fw-semibold text-secondary mb-1"),
+                    dbc.Select(
+                        id="conn-explorer-catalogs-select",
+                        options=cat_opts,
+                        value=initial_cat,
+                        placeholder="Choose a Catalog...",
+                        className="rounded-pill px-3 py-2 small",
+                    ),
+                ], md=4, className="mb-3"),
+
+                dbc.Col([
+                    dbc.Label("Select Schema", className="small fw-semibold text-secondary mb-1"),
+                    dbc.Select(
+                        id="conn-explorer-schemas-select",
+                        options=sch_opts,
+                        value=initial_sch,
+                        placeholder="Choose a Schema...",
+                        className="rounded-pill px-3 py-2 small",
+                    ),
+                ], md=4, className="mb-3"),
+
+                dbc.Col([
+                    dbc.Label("Select Table / Delta Dataset", className="small fw-semibold text-secondary mb-1"),
+                    dbc.Select(
+                        id="conn-explorer-tables-select",
+                        options=tbl_opts,
+                        value=tbl_opts[0]["value"] if tbl_opts else None,
+                        placeholder="Choose a Table...",
+                        className="rounded-pill px-3 py-2 small",
+                    ),
+                ], md=4, className="mb-3"),
+            ]),
+
+            # Volumes Discovery Section (Images / Raw Files / CSVs)
+            html.Div(id="conn-explorer-volumes-container", children=_render_volumes_list(initial_volumes, initial_cat, initial_sch), className="mb-3"),
+
+            # Table Schema & Metadata Inspector
+            html.Div(id="conn-explorer-table-metadata-container", children=_render_explorer_table_metadata(initial_cat, initial_sch, tbl_opts[0]["value"] if tbl_opts else None)),
+        ])
+    else:
+        explorer_content = html.Div([
+            html.Div([
+                html.I(className="bi bi-compass-fill text-muted me-2 fs-5"),
+                html.Span("Live Unity Catalog Resource Explorer", className="fw-bold fs-6 text-muted"),
+            ], className="d-flex align-items-center mb-2"),
+            html.Div([
+                html.I(className="bi bi-clouds fs-1 text-muted d-block mb-3"),
+                html.H6("No Databricks Workspace Connected", className="fw-bold text-dark"),
+                html.P("Connect your Databricks account above to discover your accessible Unity Catalog catalogs, schemas, tables, and volumes.", className="text-muted small"),
+            ], className="text-center py-5 bg-light rounded border"),
+        ])
+
+    explorer_card = html.Div(explorer_content, className="dq-card p-4")
+
+    return html.Div([
+        header,
+        kpi_cards,
+        connection_form,
+        explorer_card,
+    ])
+
 # -------------------------------------------------------------
 # ROUTER CALLBACK
 # -------------------------------------------------------------
@@ -3341,7 +3711,9 @@ def page_audit():
 )
 def render_page(pathname):
     page = (pathname or "/overview").strip("/").lower()
-    if page == "management":
+    if page == "connection":
+        return page_connection()
+    elif page == "management":
         return page_management()
     elif page == "rules":
         return page_rules()
@@ -3433,10 +3805,11 @@ def handle_test_connectivity(n_clicks, src_table, tgt_table, b_key):
      State("new-project-notif-enabled", "value"),
      State("new-project-source-table", "value"),
      State("new-project-target-table", "value"),
-     State("new-project-business-key", "value")],
+     State("new-project-business-key", "value"),
+     State("new-project-dataset-name", "value")],
     prevent_initial_call=True,
 )
-def handle_add_project(open_click, cancel_click, submit_click, is_open, name, desc, owner, team_email, add_emails, notif_enabled, src_tbl, tgt_tbl, b_key):
+def handle_add_project(open_click, cancel_click, submit_click, is_open, name, desc, owner, team_email, add_emails, notif_enabled, src_tbl, tgt_tbl, b_key, ds_name=None):
     trig = ctx.triggered_id
     _ts = datetime.now().isoformat()
     if not trig or not _real_click():
@@ -3452,6 +3825,7 @@ def handle_add_project(open_click, cancel_click, submit_click, is_open, name, de
             description=desc or "",
             owner=owner or "Data Engineering Team",
             domain=None,
+            dataset_name=ds_name,
             source_table=src_tbl or "",
             target_table=tgt_tbl or src_tbl,
             business_key=b_key or "id",
@@ -3990,47 +4364,190 @@ def on_file_uploaded(contents, filename):
     )
 
 
+# -------------------------------------------------------------
+# DATABRICKS CONNECTION MANAGER & DYNAMIC DISCOVERY CALLBACKS
+# -------------------------------------------------------------
+
+@app.callback(
+    [Output("conn-form-profile-container", "style"),
+     Output("conn-form-token-container", "style")],
+    Input("conn-form-auth-type", "value"),
+)
+def toggle_conn_form_auth(auth_type):
+    if auth_type == "CLI_PROFILE":
+        return {"display": "block"}, {"display": "none"}
+    elif auth_type == "PAT":
+        return {"display": "none"}, {"display": "block"}
+    return {"display": "none"}, {"display": "none"}
+
+
+@app.callback(
+    [Output("conn-form-alert", "children"),
+     Output("connection-refresh-store", "data", allow_duplicate=True),
+     Output("conn-form-host", "value")],
+    Input("btn-conn-submit", "n_clicks"),
+    [State("conn-form-auth-type", "value"),
+     State("conn-form-host", "value"),
+     State("conn-form-token", "value"),
+     State("conn-form-profile", "value")],
+    prevent_initial_call=True,
+)
+def handle_connect_databricks_action(n_clicks, auth_type, host, token, profile):
+    if not _real_click():
+        return dash.no_update, dash.no_update, dash.no_update
+
+    res = db_adapter.connect_databricks_workspace(
+        host=host,
+        token=token,
+        auth_type=auth_type,
+        profile=profile,
+    )
+    _ts = datetime.now().isoformat()
+    clean_h = res.get("clean_host") or (host or "").split("?")[0].split("#")[0].rstrip("/")
+
+    if res.get("success"):
+        alert = dbc.Alert([
+            html.I(className="bi bi-check-circle-fill me-2 fs-5"),
+            html.Span(res.get("message", "Connected successfully!"), className="fw-semibold"),
+        ], color="success", className="py-2 mb-0")
+        return alert, _ts, clean_h
+    else:
+        msg_content = [
+            html.Div([
+                html.I(className="bi bi-exclamation-triangle-fill me-2 fs-5 text-warning"),
+                html.Span(res.get("message", "Connection failed."), className="fw-semibold"),
+            ], className="d-flex align-items-center mb-2"),
+        ]
+        if res.get("suggest_pat"):
+            msg_content.append(html.Div([
+                html.Div([
+                    html.B("Quick Fix for Databricks Free Edition / Personal Workspaces:"),
+                    html.Ul([
+                        html.Li([
+                            "In your Databricks workspace (top right), click your user profile icon → ",
+                            html.B("Settings"), " → ", html.B("Developer"), " → ", html.B("Access tokens"), " → ", html.B("Manage"), " → ", html.B("Generate new token"), "."
+                        ]),
+                        html.Li("Copy the token (starts with dapi...)."),
+                        html.Li("Select 'Personal Access Token (Development Fallback)' above, paste the token, and click 'Connect to Databricks'."),
+                    ], className="mb-0 ps-3 small mt-1"),
+                ], className="p-3 rounded bg-white border small text-dark mt-2 shadow-sm"),
+            ]))
+        alert = dbc.Alert(msg_content, color="danger" if not res.get("suggest_pat") else "warning", className="py-2 mb-0")
+        return alert, _ts, clean_h
+
+
+@app.callback(
+    [Output("conn-form-alert", "children", allow_duplicate=True),
+     Output("connection-refresh-store", "data", allow_duplicate=True)],
+    Input("btn-conn-disconnect", "n_clicks"),
+    prevent_initial_call=True,
+)
+def handle_disconnect_databricks_action(n_clicks):
+    if not _real_click():
+        return dash.no_update, dash.no_update
+    res = db_adapter.disconnect_databricks_workspace()
+    _ts = datetime.now().isoformat()
+    alert = dbc.Alert([
+        html.I(className="bi bi-info-circle-fill me-2"),
+        res.get("message", "Disconnected successfully."),
+    ], color="secondary", className="py-2 mb-0")
+    return alert, _ts
+
+
+@app.callback(
+    Output("conn-form-alert", "children", allow_duplicate=True),
+    Input("btn-conn-verify", "n_clicks"),
+    prevent_initial_call=True,
+)
+def handle_verify_databricks_action(n_clicks):
+    if not _real_click():
+        return dash.no_update
+    res = db_adapter.verify_databricks_connection()
+    if res.get("connected"):
+        return dbc.Alert([
+            html.I(className="bi bi-check-circle-fill me-2"),
+            f"Active Databricks connection verified. Authenticated as: {res.get('username')}.",
+        ], color="success", className="py-2 mb-0")
+    else:
+        return dbc.Alert([
+            html.I(className="bi bi-exclamation-octagon-fill me-2"),
+            f"Connection verification failed: {res.get('message')}. Please reconnect.",
+        ], color="warning", className="py-2 mb-0")
+
+
+@app.callback(
+    [Output("conn-explorer-schemas-select", "options"),
+     Output("conn-explorer-schemas-select", "value")],
+    [Input("conn-explorer-catalogs-select", "value"),
+     Input("btn-conn-refresh-discovery", "n_clicks")],
+    prevent_initial_call=True,
+)
+def update_explorer_schemas(cat, n_clicks):
+    if not cat:
+        return [], None
+    refresh = _safe_triggered_id() == "btn-conn-refresh-discovery"
+    schemas = db_adapter.get_unity_schemas(cat, refresh=refresh)
+    opts = [{"label": s["name"], "value": s["name"]} for s in schemas]
+    val = opts[0]["value"] if opts else None
+    return opts, val
+
+
+@app.callback(
+    [Output("conn-explorer-tables-select", "options"),
+     Output("conn-explorer-tables-select", "value"),
+     Output("conn-explorer-volumes-container", "children")],
+    [Input("conn-explorer-schemas-select", "value"),
+     Input("conn-explorer-catalogs-select", "value")],
+    prevent_initial_call=True,
+)
+def update_explorer_tables(sch, cat):
+    if not cat or not sch:
+        return [], None, html.Div()
+    tables = db_adapter.get_unity_tables(cat, sch)
+    tbl_opts = [{"label": f"{t['name']} ({t.get('type', 'MANAGED')})", "value": t["name"]} for t in tables]
+    val = tbl_opts[0]["value"] if tbl_opts else None
+    if not tbl_opts:
+        tbl_opts = [{"label": f"ℹ️ 0 tables in '{cat}.{sch}' (try selecting another schema or catalog)", "value": "", "disabled": True}]
+        val = None
+    volumes = db_adapter.get_unity_volumes(cat, sch)
+    vol_ui = _render_volumes_list(volumes, cat, sch)
+    return tbl_opts, val, vol_ui
+
+
+@app.callback(
+    Output("conn-explorer-table-metadata-container", "children"),
+    [Input("conn-explorer-tables-select", "value"),
+     State("conn-explorer-catalogs-select", "value"),
+     State("conn-explorer-schemas-select", "value")],
+    prevent_initial_call=True,
+)
+def update_explorer_table_metadata(tbl, cat, sch):
+    if not cat or not sch or not tbl:
+        return html.Div()
+    return _render_explorer_table_metadata(cat, sch, tbl)
+
+
+@app.callback(
+    Output("sidebar-connection-status", "children"),
+    Input("connection-refresh-store", "data"),
+    prevent_initial_call=True,
+)
+def update_sidebar_connection_status(conn_ts):
+    return _render_sidebar_connection_status()
+
+
 # ── Option 2 Dynamic Unity Catalog Discovery Callbacks ──────────────────────
 
 @app.callback(
-    Output("collapse-workspace-settings", "is_open"),
-    Input("btn-toggle-workspace-settings", "n_clicks"),
-    State("collapse-workspace-settings", "is_open"),
+    Output("modal-connection-bar-container", "children"),
+    [Input("modal-add-dataset", "is_open"),
+     Input("connection-refresh-store", "data")],
     prevent_initial_call=True,
 )
-def toggle_workspace_settings(n_clicks, is_open):
-    if not _real_click():
+def refresh_modal_connection_bar(is_open, conn_data):
+    if not is_open:
         return dash.no_update
-    return not is_open
-
-
-@app.callback(
-    [Output("workspace-connected-host", "children"),
-     Output("workspace-connected-auth", "children"),
-     Output("workspace-connect-alert", "children")],
-    Input("btn-connect-workspace", "n_clicks"),
-    [State("input-workspace-host", "value"),
-     State("input-workspace-token", "value")],
-    prevent_initial_call=True,
-)
-def on_connect_workspace(n_clicks, host, token):
-    if not _real_click():
-        return dash.no_update, dash.no_update, dash.no_update
-    res = db_adapter.connect_databricks_workspace(host=host, token=token)
-    if res.get("success"):
-        h_clean = (host or "").replace("https://", "").replace("http://", "").strip().rstrip("/")
-        auth_msg = f" ({res.get('auth_type', 'OAuth')} Active)"
-        alert = dbc.Alert([
-            html.I(className="bi bi-check-circle-fill me-1"),
-            res.get("message", "Connected successfully.")
-        ], color="success", className="py-1 mb-0 small")
-        return h_clean, auth_msg, alert
-    else:
-        alert = dbc.Alert([
-            html.I(className="bi bi-exclamation-triangle-fill me-1"),
-            res.get("message", "Connection failed.")
-        ], color="danger", className="py-1 mb-0 small")
-        return dash.no_update, dash.no_update, alert
+    return _render_modal_connection_bar()
 
 
 @app.callback(
@@ -4039,14 +4556,15 @@ def on_connect_workspace(n_clicks, host, token):
      Output("select-existing-target-catalog", "options")],
     [Input("modal-add-dataset", "is_open"),
      Input("dataset-reg-method", "value"),
-     Input("btn-refresh-catalogs", "n_clicks")],
+     Input("btn-refresh-catalogs", "n_clicks"),
+     Input("connection-refresh-store", "data")],
     State("select-existing-catalog", "value"),
     prevent_initial_call=True,
 )
-def load_catalogs(is_open, method, n_clicks, current_val):
+def load_catalogs(is_open, method, n_clicks, conn_data, current_val):
     if not is_open:
         return dash.no_update, dash.no_update, dash.no_update
-    refresh = _safe_triggered_id() == "btn-refresh-catalogs"
+    refresh = _safe_triggered_id() in ("btn-refresh-catalogs", "connection-refresh-store")
     catalogs = db_adapter.get_unity_catalogs(refresh=refresh)
     opts = []
     cat_names = []
@@ -4055,7 +4573,7 @@ def load_catalogs(is_open, method, n_clicks, current_val):
         cat_names.append(name)
         comment = f" - {c.get('comment')}" if isinstance(c, dict) and c.get('comment') else ""
         opts.append({"label": f"{name}{comment}", "value": name})
-    val = current_val if current_val in cat_names else ("hospital_catalog" if "hospital_catalog" in cat_names else (cat_names[0] if cat_names else None))
+    val = current_val if (current_val and current_val in cat_names) else (cat_names[0] if cat_names else None)
     return opts, val, opts
 
 
@@ -4079,7 +4597,7 @@ def load_schemas(cat, n_clicks, current_val):
         sch_names.append(name)
         comment = f" - {s.get('comment')}" if isinstance(s, dict) and s.get('comment') else ""
         opts.append({"label": f"{name}{comment}", "value": name})
-    val = current_val if current_val in sch_names else ("healthcare" if cat == "hospital_catalog" and "healthcare" in sch_names else (sch_names[0] if sch_names else None))
+    val = current_val if (current_val and current_val in sch_names) else (sch_names[0] if sch_names else None)
     return opts, val
 
 
@@ -4104,7 +4622,10 @@ def load_tables(sch, cat, n_clicks, current_val):
         tbl_names.append(name)
         tbl_type = f" ({t.get('type')})" if isinstance(t, dict) and t.get('type') else ""
         opts.append({"label": f"{name}{tbl_type}", "value": name})
-    val = current_val if current_val in tbl_names else ("source_table" if cat == "hospital_catalog" and "source_table" in tbl_names else (tbl_names[0] if tbl_names else None))
+    val = current_val if (current_val and current_val in tbl_names) else (tbl_names[0] if tbl_names else None)
+    if not opts:
+        opts = [{"label": f"ℹ️ 0 tables in '{cat}.{sch}' (try selecting another schema or catalog)", "value": "", "disabled": True}]
+        val = None
     return opts, val
 
 
@@ -4162,7 +4683,7 @@ def load_target_schemas(cat):
         name = s["name"] if isinstance(s, dict) else str(s)
         sch_names.append(name)
         opts.append({"label": name, "value": name})
-    val = "healthcare" if cat == "hospital_catalog" and "healthcare" in sch_names else (sch_names[0] if sch_names else None)
+    val = sch_names[0] if sch_names else None
     return opts, val
 
 
@@ -4184,7 +4705,10 @@ def load_target_tables(sch, cat):
         tbl_names.append(name)
         tbl_type = f" ({t.get('type')})" if isinstance(t, dict) and t.get('type') else ""
         opts.append({"label": f"{name}{tbl_type}", "value": name})
-    val = "patients_target" if cat == "hospital_catalog" and "patients_target" in tbl_names else (tbl_names[0] if tbl_names else None)
+    val = tbl_names[0] if tbl_names else None
+    if not opts:
+        opts = [{"label": f"ℹ️ 0 tables in '{cat}.{sch}'", "value": "", "disabled": True}]
+        val = None
     return opts, val
 
 
@@ -4802,16 +5326,18 @@ def handle_save_schedule(n_clicks, s_name, proj, ds, freq, tz, s_date, s_time,
      Output("exec-store", "data", allow_duplicate=True),
      Output("exec-interval", "disabled", allow_duplicate=True),
      Output("btn-trigger-validation", "disabled", allow_duplicate=True),
-     Output("btn-cancel-execution", "disabled", allow_duplicate=True)],
+     Output("btn-cancel-execution", "disabled", allow_duplicate=True),
+     Output("exec-history-table-body", "children", allow_duplicate=True)],
     [Input("btn-refresh-schedules", "n_clicks"),
      Input("sched-filter-status", "value"),
      Input("exec-select-project", "value"),
+     Input("sched-auto-refresh-interval", "n_intervals"),
      Input({"type": "btn-sched-run-now", "id": dash.ALL}, "n_clicks"),
      Input({"type": "btn-sched-toggle-status", "id": dash.ALL, "status": dash.ALL}, "n_clicks"),
      Input({"type": "btn-sched-delete", "id": dash.ALL}, "n_clicks")],
     prevent_initial_call="initial_duplicate",
 )
-def handle_schedules_table_actions(refresh_clicks, st_filter, proj, run_clicks, toggle_clicks, delete_clicks):
+def handle_schedules_table_actions(refresh_clicks, st_filter, proj, auto_tick, run_clicks, toggle_clicks, delete_clicks):
     trig = ctx.triggered_id
     if isinstance(trig, dict) and _real_click():
         action_type = trig.get("type")
@@ -4827,7 +5353,8 @@ def handle_schedules_table_actions(refresh_clicks, st_filter, proj, run_clicks, 
                 "_started_ts": time.time()
             }
             rows = _render_schedules_table(project_name=proj, status=st_filter)
-            return rows, new_store, False, True, False
+            hist = _render_history_table(project_name=proj)
+            return rows, new_store, False, True, False, hist
         elif action_type == "btn-sched-toggle-status":
             current_st = trig.get("status")
             if current_st == "ACTIVE":
@@ -4838,7 +5365,8 @@ def handle_schedules_table_actions(refresh_clicks, st_filter, proj, run_clicks, 
             db_adapter.delete_schedule(sid, user="admin")
 
     rows = _render_schedules_table(project_name=proj, status=st_filter)
-    return rows, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    hist = _render_history_table(project_name=proj)
+    return rows, dash.no_update, dash.no_update, dash.no_update, dash.no_update, hist
 
 
 # Callback E2: Run Validation button → concurrent parallel execution
@@ -4855,7 +5383,8 @@ def handle_schedules_table_actions(refresh_clicks, st_filter, proj, run_clicks, 
      Output("exec-count-error", "children"),
      Output("exec-dq-score", "children"),
      Output("exec-stepper-container", "children"),
-     Output("exec-meta-duration", "children")],
+     Output("exec-meta-duration", "children"),
+     Output("exec-history-table-body", "children", allow_duplicate=True)],
     Input("btn-trigger-validation", "n_clicks"),
     [State("exec-select-project", "value"),
      State("exec-select-dataset", "value"),
@@ -4865,39 +5394,88 @@ def handle_schedules_table_actions(refresh_clicks, st_filter, proj, run_clicks, 
 )
 def handle_run_validation(n_clicks, proj, ds, rules_mode, selected_rules):
     if not proj or not ds or not _real_click():
-        return (dash.no_update,) * 13
+        return (dash.no_update,) * 14
 
     rule_ids_param = selected_rules if rules_mode == "SELECTED" else None
     res = db_adapter.trigger_validation(proj, ds, run_type="MANUAL", rule_ids=rule_ids_param)
-    exec_id = res["execution_id"]
-    start_time = res["start_time"]
+    exec_id = res.get("execution_id", "—")
+    start_time = res.get("start_time", "—")
 
     store = {"execution_id": exec_id, "project": proj, "dataset": ds,
              "start_time": start_time, "_started_ts": time.time()}
 
-    live_items = [
-        html.Div([
-            html.I(className="bi bi-arrow-repeat text-primary me-2"),
-            html.Span(f"Executing {res['total_rules']} rules concurrently across 4 worker threads…", className="fw-semibold"),
-        ], className="mb-2 p-2 rounded", style={"backgroundColor": "#EFF6FF"}),
-    ]
+    # Build real-time rule results stream
+    rule_results = res.get("rule_results", [])
+    live_items = []
+    for p in rule_results:
+        s = p.get("status", "PASS")
+        if s == "PASS":
+            icon_cls = "bi bi-check-circle-fill text-success me-2"
+            bg = "#F0FDF4"
+        elif s == "FAIL":
+            icon_cls = "bi bi-x-circle-fill text-danger me-2"
+            bg = "#FEF2F2"
+        elif s == "ERROR":
+            icon_cls = "bi bi-exclamation-triangle-fill text-warning me-2"
+            bg = "#FFFBEB"
+        elif s == "CANCELLED":
+            icon_cls = "bi bi-x-octagon-fill text-secondary me-2"
+            bg = "#F1F5F9"
+        else:
+            icon_cls = "bi bi-arrow-repeat text-primary me-2"
+            bg = "#EFF6FF"
 
-    stepper = _render_stepper("RUNNING", 0, res.get("total_rules", 0))
+        label = f"{p.get('name') or p.get('rule_name', 'Rule')} — {s}"
+        if s == "FAIL" and p.get("failures", 0) > 0:
+            label += f" ({p['failures']} defect{'s' if p['failures'] > 1 else ''})"
+        
+        worker_txt = str(p.get("worker") or p.get("worker_thread") or "Worker")
+        dur_txt = f"{p.get('duration_ms', 0)}ms" if p.get('duration_ms') else ""
+
+        live_items.append(html.Div([
+            html.Div([
+                html.I(className=icon_cls),
+                html.Span(label, className="fw-semibold small"),
+            ]),
+            html.Div([
+                html.Span(dur_txt, className="text-muted small me-2") if dur_txt else None,
+                html.Span(worker_txt, className="badge bg-light text-secondary border small"),
+            ]),
+        ], className="mb-2 p-2 rounded d-flex justify-content-between align-items-center", style={"backgroundColor": bg}))
+
+    if not live_items:
+        live_items = [html.Div("No active rules evaluated.", className="text-muted p-2")]
+
+    passed = res.get("passed", 0)
+    failed = res.get("failed", 0)
+    errored = res.get("errored", 0)
+    dq_score = res.get("dq_score", 0.0)
+    dur_str = res.get("duration", "1s")
+    total_rules = res.get("total_rules", len(rule_results))
+    status = res.get("status", "COMPLETED")
+    stepper = _render_stepper(status, total_rules, total_rules)
+    score_disp = f"{dq_score:.1f}%" if total_rules > 0 else "N/A"
+
+    try:
+        hist_rows = _render_history_table(project_name=proj, dataset_name=ds)
+    except Exception:
+        hist_rows = dash.no_update
 
     return (
         store,          # exec-store
         exec_id,        # exec-meta-id
         start_time,     # exec-meta-start
-        False,          # enable interval
-        True,           # disable run button
-        False,          # enable cancel button
-        live_items,     # live progress list
-        "…",            # pass count
-        "…",            # fail count
-        "…",            # error count
-        "…",            # dq score
+        True,           # disable interval (synchronous run already completed)
+        False,          # re-enable run button
+        True,           # disable cancel button
+        live_items,     # live progress list with all rules
+        str(passed),    # pass count
+        str(failed),    # fail count
+        str(errored),   # error count
+        score_disp,     # dq score
         stepper,        # stepper
-        "Running…",     # duration
+        dur_str,        # duration
+        hist_rows,      # execution history table
     )
 
 

@@ -34,8 +34,18 @@ def parse_datetime_safe(dt_str: Optional[str]) -> Optional[datetime.datetime]:
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d %H:%M",
         "%Y-%m-%d",
+        "%d-%m-%Y %H:%M:%S",
+        "%d-%m-%Y %H:%M",
+        "%d-%m-%Y",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y",
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M",
+        "%m/%d/%Y",
         "%d %b %Y, %I:%M %p",
-        "%d %b %Y, %H:%M"
+        "%d %b %Y, %H:%M",
+        "%d %b %Y"
     ):
         try:
             return datetime.datetime.strptime(str(dt_str).strip(), fmt)
@@ -80,7 +90,9 @@ def calculate_next_run(
             s_dt = parse_datetime_safe(start_date)
             if s_dt:
                 s_dt = s_dt.replace(hour=hour, minute=minute, second=0)
-        if s_dt and s_dt > now:
+        if s_dt:
+            if after_dt and s_dt <= after_dt:
+                return None
             return s_dt.strftime("%Y-%m-%d %H:%M:%S")
         return None
 
@@ -93,7 +105,7 @@ def calculate_next_run(
         cand = s_dt
         while cand <= now:
             cand += datetime.timedelta(hours=repeat_interval)
-        if end_date:
+        if end_date and str(end_date).strip():
             e_dt = parse_datetime_safe(end_date)
             if e_dt and cand.date() > e_dt.date():
                 return None
@@ -111,7 +123,7 @@ def calculate_next_run(
             cand = s_date_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
             if cand <= now:
                 cand += datetime.timedelta(days=repeat_interval)
-        if end_date:
+        if end_date and str(end_date).strip():
             e_dt = parse_datetime_safe(end_date)
             if e_dt and cand.date() > e_dt.date():
                 return None
@@ -138,7 +150,7 @@ def calculate_next_run(
                 if s_date_dt and cand.date() < s_date_dt.date():
                     cand += datetime.timedelta(days=1)
                     continue
-                if end_date:
+                if end_date and str(end_date).strip():
                     e_dt = parse_datetime_safe(end_date)
                     if e_dt and cand.date() > e_dt.date():
                         return None
@@ -169,7 +181,7 @@ def calculate_next_run(
                 cand = datetime.datetime(year, month, dom, hour, minute, 0)
             except ValueError:
                 cand = datetime.datetime(year, month, 28, hour, minute, 0)
-        if end_date:
+        if end_date and str(end_date).strip():
             e_dt = parse_datetime_safe(end_date)
             if e_dt and cand.date() > e_dt.date():
                 return None
@@ -203,7 +215,7 @@ def calculate_next_run(
                 if c_dow != "*" and not _cron_match(cand.weekday(), c_dow, is_dow=True):
                     cand = cand.replace(hour=0, minute=0) + datetime.timedelta(days=1)
                     continue
-                if end_date:
+                if end_date and str(end_date).strip():
                     e_dt = parse_datetime_safe(end_date)
                     if e_dt and cand.date() > e_dt.date():
                         return None
@@ -349,7 +361,7 @@ class DQSchedulerService:
             # Check if an execution is currently running for this project/dataset
             running_df = db_adapter.query_df("""
                 SELECT execution_id FROM dq_execution_summary
-                WHERE project_name = ? AND dataset_name = ? AND dq_status = 'RUNNING'
+                WHERE project_name = ? AND dataset_name = ? AND (overall_status = 'RUNNING' OR dq_status = 'RUNNING')
             """, (proj_name, ds_name))
 
             if not running_df.empty and concurrency_policy == "SKIP":

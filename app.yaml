@@ -6,11 +6,5 @@ command:
 - -b
 - 0.0.0.0:8000
 env:
-- name: DATABRICKS_HOST
-  value: https://dbc-9f225403-7c26.cloud.databricks.com
-- name: DATABRICKS_HTTP_PATH
-  value: /sql/1.0/warehouses/37a0b45852e3d676
-- name: DQ_CATALOG_SCHEMA
-  value: hospital_catalog.healthcare
-- name: DQ_JOB_ID
-  value: "798854749746341"
+- name: DATABRICKS_APP_PORT
+  value: "8000"

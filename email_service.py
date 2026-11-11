@@ -867,10 +867,15 @@ def send_test_email(recipient_email: str, user: str = "admin") -> Dict[str, Any]
     )
 
     if res["success"]:
+        provider_name = res.get("provider") or cfg.get("provider", "SMTP")
+        if "simulat" in provider_name.lower() or "sandbox" in provider_name.lower():
+            msg = f"Simulated test email recorded locally for {recipient_email}. (Real SMTP not configured in .env; please enter SMTP credentials below to send real emails to your inbox)."
+        else:
+            msg = f"Test email successfully dispatched to {recipient_email} via {provider_name}."
         return {
             "success": True,
             "status": "SENT",
-            "message": f"Test email successfully dispatched to {recipient_email} via {cfg['provider']}.",
+            "message": msg,
             "details": res,
         }
     else:

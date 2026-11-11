@@ -368,6 +368,7 @@ def _init_local_db():
         ("notification_status", "TEXT DEFAULT 'PENDING'"),
         ("failure_reason", "TEXT"),
         ("notification_id", "INTEGER"),
+        ("provider", "TEXT"),
     ]:
         try:
             cur.execute(f"ALTER TABLE dq_alerts ADD COLUMN {col} {ctype}")
@@ -926,30 +927,37 @@ def get_alerts_data(status_filter: Optional[str] = None,
                     **kwargs) -> Dict[str, Any]:
     """Retrieves alerts with filtering and summary metrics."""
     sql = """
-    SELECT alert_id, execution_id, created_at AS date_time, project_id, project_name, dataset_id, dataset_name,
-           rule_id, rule_name, column_name, severity, status, failure_count, threshold, notification_status, message,
-           acknowledged_by, acknowledged_at, closed_by, closed_at, failure_reason, notification_id
-    FROM dq_alerts
+    SELECT a.alert_id, a.execution_id, a.created_at AS date_time, a.project_id, a.project_name, a.dataset_id, a.dataset_name,
+           a.rule_id, a.rule_name, a.column_name, a.severity, a.status, a.failure_count, a.threshold, a.notification_status, a.message,
+           a.acknowledged_by, a.acknowledged_at, a.closed_by, a.closed_at, a.failure_reason, a.notification_id,
+           COALESCE(a.provider, l.provider, 'Local Sandbox Simulator') AS provider,
+           l.recipient_email
+    FROM dq_alerts a
+    LEFT JOIN (
+        SELECT execution_id, provider, recipient_email, MAX(notification_id)
+        FROM dq_email_notification_log
+        GROUP BY execution_id
+    ) l ON a.execution_id = l.execution_id
     WHERE 1=1
     """
     params = []
     if status_filter and status_filter != "All":
-        sql += " AND LOWER(status) = LOWER(?)"
+        sql += " AND LOWER(a.status) = LOWER(?)"
         params.append(status_filter)
     if severity_filter and severity_filter != "All":
-        sql += " AND LOWER(severity) = LOWER(?)"
+        sql += " AND LOWER(a.severity) = LOWER(?)"
         params.append(severity_filter)
     if project_filter and project_filter != "All":
-        sql += " AND (project_name = ? OR REPLACE(project_name, '  ', ' ') = REPLACE(?, '  ', ' '))"
+        sql += " AND (a.project_name = ? OR REPLACE(a.project_name, '  ', ' ') = REPLACE(?, '  ', ' '))"
         params.extend([project_filter, project_filter])
     if dataset_filter and dataset_filter != "All":
-        sql += " AND dataset_name = ?"
+        sql += " AND a.dataset_name = ?"
         params.append(dataset_filter)
     if search and search.strip():
         term = f"%{search.strip()}%"
-        sql += " AND (rule_name LIKE ? OR message LIKE ? OR execution_id LIKE ? OR dataset_name LIKE ? OR project_name LIKE ? OR column_name LIKE ?)"
+        sql += " AND (a.rule_name LIKE ? OR a.message LIKE ? OR a.execution_id LIKE ? OR a.dataset_name LIKE ? OR a.project_name LIKE ? OR a.column_name LIKE ?)"
         params.extend([term, term, term, term, term, term])
-    sql += " ORDER BY alert_id DESC"
+    sql += " ORDER BY a.alert_id DESC"
     
     df = query_df(sql, tuple(params))
     
@@ -1119,9 +1127,9 @@ def send_project_failure_notification(
     msg_id = send_res.get("provider_message_id")
     retries = send_res.get("retry_count", 0)
 
-    # Update notification_status and failure_reason on dq_alerts
-    execute_cmd("UPDATE dq_alerts SET notification_status = ?, failure_reason = ? WHERE execution_id = ?",
-                (delivery_status, error_msg, execution_id))
+    # Update notification_status, failure_reason, and provider on dq_alerts
+    execute_cmd("UPDATE dq_alerts SET notification_status = ?, failure_reason = ?, provider = ? WHERE execution_id = ?",
+                (delivery_status, error_msg, provider, execution_id))
 
     # Log to dq_email_notification_log for each recipient
     for r_email in recipients:

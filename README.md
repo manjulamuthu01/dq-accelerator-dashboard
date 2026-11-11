@@ -98,13 +98,14 @@ Modern data platforms require robust, continuous quality validation to ensure do
 | Page | Route | Description |
 | :--- | :--- | :--- |
 | **1. Overview** | `/` | Executive KPIs, total datasets monitored, rule pass/fail distributions, active alert feeds, and DQ score trends. |
-| **2. Projects & Datasets** | `/management` | Register projects, configure primary/additional team email recipients, upload local datasets (CSV, JSON, Parquet, Excel), or connect via Unity Catalog discovery. |
+| **2. Projects & Datasets** | `/management` | Register projects, configure primary/additional team email recipients, upload local datasets (CSV, JSON, Parquet, Excel), or connect via dynamic Unity Catalog discovery. |
 | **3. Rule Library** | `/rule-library` | Catalog of DQ rules categorized by dimensions. Dynamic rule builder with SQL preview, parameter inputs, and threshold configuration. |
-| **4. Execution & Monitoring** | `/execution` | Orchestrate validations via **Manual Trigger** ("Run Now") or **Scheduled Trigger** (Cron). Displays active rules, live execution timeline, duration, and DQ score. |
-| **5. DQ Results** | `/results` | Detailed breakdown of validated rules, observed vs. expected metrics, record failure counts, and row-level anomaly inspection modals. |
-| **6. Reconciliation** | `/reconciliation` | Source vs. target dataset reconciliation: row count matching, missing keys, duplicate keys, and column discrepancy sampling. |
-| **7. Alerts & Reports** | `/alerts` | Alert resolution workflow, severity breakdown, email delivery tracking (`SENT`, `FAILED`, `RETRYING`), self-service SMTP diagnostic tools, and standard CSV reports. |
-| **8. Audit History** | `/audit` | Complete execution log history and entity configuration change tracking (`dq_config_audit`). |
+| **4. Databricks Connection** | `/connection` | User-based Databricks workspace authentication (OAuth U2M, CLI Profile, PAT fallback) and live Unity Catalog Resource Explorer (Catalogs, Schemas, Tables, Volumes). |
+| **5. Execution & Monitoring** | `/execution` | Orchestrate validations via **Manual Trigger** ("Run Now") or **Scheduled Trigger** (Cron/Daily). Displays active rules, live execution timeline, duration, and DQ score with auto-refresh. |
+| **6. DQ Results** | `/results` | Detailed breakdown of validated rules, observed vs. expected metrics, record failure counts, and row-level anomaly inspection modals. |
+| **7. Reconciliation** | `/reconciliation` | Source vs. target dataset reconciliation: row count matching, missing keys, duplicate keys, and column discrepancy sampling. |
+| **8. Alerts & Reports** | `/alerts` | Alert resolution workflow, severity breakdown, email delivery tracking (`SENT`, `FAILED`, `RETRYING`), self-service SMTP diagnostic tools, and standard CSV reports. |
+| **Bonus: Audit History** | `/audit` | Complete execution log history and entity configuration change tracking (`dq_config_audit`). |
 
 ---
 
@@ -114,6 +115,7 @@ Modern data platforms require robust, continuous quality validation to ensure do
 dq-accelerator-dashboard/
 ├── accelerator/
 │   ├── __init__.py               # Accelerator module package init
+│   ├── databricks_connection.py  # User-scoped Databricks auth & Unity Catalog dynamic discovery
 │   └── orchestrator.py           # Databricks workflow integration wrapper
 ├── notebooks/
 │   ├── 01_environment_setup.py   # Databricks workspace & schema initialization

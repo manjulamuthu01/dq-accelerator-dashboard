@@ -319,6 +319,49 @@ app.index_string = """<!DOCTYPE html>
         .clean-table tr:hover td {
             background-color: #F8FAFC;
         }
+        /* Overview Recent Executions Table & Card Fixes */
+        .overview-table-wrapper {
+            width: 100% !important;
+            min-width: 0 !important;
+            overflow-x: auto !important;
+            box-sizing: border-box !important;
+        }
+        .overview-recent-table {
+            width: 100% !important;
+            table-layout: fixed !important;
+            box-sizing: border-box !important;
+        }
+        .overview-recent-table th,
+        .overview-recent-table td {
+            box-sizing: border-box !important;
+            overflow-wrap: anywhere !important;
+            word-break: break-word !important;
+        }
+        .overview-recent-table th:nth-child(1),
+        .overview-recent-table td:nth-child(1) {
+            width: 18% !important;
+        }
+        .overview-recent-table th:nth-child(2),
+        .overview-recent-table td:nth-child(2) {
+            width: 22% !important;
+        }
+        .overview-recent-table th:nth-child(3),
+        .overview-recent-table td:nth-child(3) {
+            width: 42% !important;
+        }
+        .overview-recent-table th:nth-child(4),
+        .overview-recent-table td:nth-child(4) {
+            width: 18% !important;
+            text-align: center !important;
+        }
+        .overview-recent-table .badge-pass,
+        .overview-recent-table .badge-fail,
+        .overview-recent-table .badge-error {
+            white-space: nowrap !important;
+            display: inline-flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+        }
         /* Stepper Pipeline */
         .stepper-container {
             display: flex;
@@ -846,13 +889,41 @@ def _build_overview_exec_rows(recent_execs):
         s = str(row["Status"])
         b_cls = "badge-pass" if s == "PASS" else ("badge-fail" if s == "FAIL" else "badge-error")
         rows.append(html.Tr([
-            html.Td(str(row.get("Time", "—")), style={"fontSize": "0.82rem"}),
-            html.Td(str(row.get("Project", "—")), style={"fontWeight": "500"}),
-            html.Td(str(row.get("Dataset", "—"))),
-            html.Td(html.Span(s, className=b_cls)),
-            html.Td(str(row.get("DQ Score", "—")), style={"fontWeight": "600", "color": "#0F172A"}),
+            html.Td(str(row.get("Time", "—")), style={
+                "width": "18%",
+                "fontSize": "0.82rem",
+                "overflowWrap": "anywhere",
+                "wordBreak": "break-word",
+                "boxSizing": "border-box",
+                "padding": "10px 12px"
+            }),
+            html.Td(str(row.get("Project", "—")), style={
+                "width": "22%",
+                "fontWeight": "500",
+                "overflowWrap": "anywhere",
+                "wordBreak": "break-word",
+                "boxSizing": "border-box",
+                "padding": "10px 12px"
+            }),
+            html.Td(str(row.get("Dataset", "—")), style={
+                "width": "42%",
+                "overflowWrap": "anywhere",
+                "wordBreak": "break-word",
+                "boxSizing": "border-box",
+                "padding": "10px 12px"
+            }),
+            html.Td(
+                html.Span(s, className=b_cls, style={"whiteSpace": "nowrap"}),
+                style={
+                    "width": "18%",
+                    "textAlign": "center",
+                    "whiteSpace": "nowrap",
+                    "boxSizing": "border-box",
+                    "padding": "10px 12px"
+                }
+            ),
         ]))
-    return rows or [html.Tr([html.Td("No executions yet.", colSpan=5,
+    return rows or [html.Tr([html.Td("No executions yet.", colSpan=4,
                                       className="text-center text-muted")])]
 
 
@@ -1043,12 +1114,24 @@ def page_overview():
             ], className="dq-card"), lg=5, className="mb-4"),
             dbc.Col(html.Div([
                 html.Div("Recent Executions", className="dq-card-title"),
-                html.Table([
-                    html.Thead(html.Tr([html.Th("Execution Date & Time"), html.Th("Project"), html.Th("Dataset"),
-                                        html.Th("Status"), html.Th("DQ Score")])),
-                    html.Tbody(id="overview-recent-exec-body", children=exec_rows),
-                ], className="clean-table"),
-            ], className="dq-card"), lg=7, className="mb-4"),
+                html.Div([
+                    html.Table([
+                        html.Colgroup([
+                            html.Col(style={"width": "18%"}),
+                            html.Col(style={"width": "22%"}),
+                            html.Col(style={"width": "42%"}),
+                            html.Col(style={"width": "18%"}),
+                        ]),
+                        html.Thead(html.Tr([
+                            html.Th("Execution Date & Time", style={"width": "18%", "boxSizing": "border-box"}),
+                            html.Th("Project", style={"width": "22%", "boxSizing": "border-box"}),
+                            html.Th("Dataset", style={"width": "42%", "boxSizing": "border-box"}),
+                            html.Th("Status", style={"width": "18%", "boxSizing": "border-box", "textAlign": "center"}),
+                        ])),
+                        html.Tbody(id="overview-recent-exec-body", children=exec_rows),
+                    ], className="clean-table overview-recent-table", style={"width": "100%", "tableLayout": "fixed", "boxSizing": "border-box"}),
+                ], className="overview-table-wrapper", style={"width": "100%", "minWidth": "0", "overflowX": "auto", "boxSizing": "border-box"}),
+            ], className="dq-card", style={"width": "100%", "minWidth": "0", "boxSizing": "border-box"}), lg=7, className="mb-4", style={"minWidth": "0"}),
         ], className="g-3"),
 
         dbc.Row([

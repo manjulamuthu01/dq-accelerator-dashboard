@@ -369,6 +369,46 @@ app.index_string = """<!DOCTYPE html>
             align-items: center !important;
             justify-content: center !important;
         }
+        /* Reconciliation Mismatched Records Table & Card Fixes */
+        .recon-mismatch-table-wrapper {
+            width: 100% !important;
+            max-width: 100% !important;
+            min-width: 0 !important;
+            overflow-x: auto !important;
+            box-sizing: border-box !important;
+            -webkit-overflow-scrolling: touch;
+        }
+        .recon-mismatch-table {
+            width: 100% !important;
+            max-width: 100% !important;
+            table-layout: fixed !important;
+            box-sizing: border-box !important;
+            border-collapse: collapse !important;
+            margin-bottom: 0 !important;
+        }
+        .recon-mismatch-table th,
+        .recon-mismatch-table td {
+            box-sizing: border-box !important;
+            white-space: normal !important;
+            overflow-wrap: anywhere !important;
+            word-break: break-word !important;
+            vertical-align: top !important;
+        }
+        .recon-mismatch-table th:nth-child(1),
+        .recon-mismatch-table td:nth-child(1) {
+            width: 22% !important;
+            max-width: 22% !important;
+        }
+        .recon-mismatch-table th:nth-child(2),
+        .recon-mismatch-table td:nth-child(2) {
+            width: 43% !important;
+            max-width: 43% !important;
+        }
+        .recon-mismatch-table th:nth-child(3),
+        .recon-mismatch-table td:nth-child(3) {
+            width: 35% !important;
+            max-width: 35% !important;
+        }
         /* Stepper Pipeline */
         .stepper-container {
             display: flex;
@@ -2971,12 +3011,53 @@ def _recon_content(recon):
     samples = recon.get("samples", pd.DataFrame())
     if isinstance(samples, pd.DataFrame) and not samples.empty:
         sample_rows = [html.Tr([
-            html.Td(str(r.get("key_id", r.get("key", r.get("patient_id", "—"))))),
-            html.Td(str(r.get("record_value", r.get("source_val", r.get("patient_name", "—"))))),
-            html.Td(str(r.get("reason", "—"))),
+            html.Td(
+                str(r.get("key_id", r.get("key", r.get("patient_id", "—")))),
+                style={
+                    "width": "22%",
+                    "maxWidth": "22%",
+                    "fontSize": "0.8rem",
+                    "fontWeight": "600",
+                    "overflowWrap": "anywhere",
+                    "wordBreak": "break-word",
+                    "whiteSpace": "normal",
+                    "boxSizing": "border-box",
+                    "padding": "10px 12px",
+                    "verticalAlign": "top",
+                }
+            ),
+            html.Td(
+                str(r.get("record_value", r.get("source_val", r.get("patient_name", "—")))),
+                style={
+                    "width": "43%",
+                    "maxWidth": "43%",
+                    "fontSize": "0.8rem",
+                    "overflowWrap": "anywhere",
+                    "wordBreak": "break-word",
+                    "whiteSpace": "normal",
+                    "boxSizing": "border-box",
+                    "padding": "10px 12px",
+                    "verticalAlign": "top",
+                }
+            ),
+            html.Td(
+                str(r.get("reason", "—")),
+                style={
+                    "width": "35%",
+                    "maxWidth": "35%",
+                    "fontSize": "0.8rem",
+                    "color": "#DC2626",
+                    "overflowWrap": "anywhere",
+                    "wordBreak": "break-word",
+                    "whiteSpace": "normal",
+                    "boxSizing": "border-box",
+                    "padding": "10px 12px",
+                    "verticalAlign": "top",
+                }
+            ),
         ]) for _, r in samples.iterrows()]
     else:
-        sample_rows = [html.Tr([html.Td("No mismatched records.", colSpan=3, className="text-center text-muted")])]
+        sample_rows = [html.Tr([html.Td("No mismatched records.", colSpan=3, className="text-center text-muted", style={"padding": "16px"})])]
 
     hist = recon.get("history", pd.DataFrame())
     if isinstance(hist, pd.DataFrame) and not hist.empty:
@@ -3011,25 +3092,43 @@ def _recon_content(recon):
                   for lbl, val in (("Matching Records", recon.get("matching", "0")), ("Missing in Target", recon.get("missing", "0")),
                                    ("Missing in Source (Extra in Target)", recon.get("extra", "0")), ("Duplicate Keys", recon.get("duplicate", "0")),
                                    ("Column Mismatches", recon.get("col_mismatches", "0")), ("NULL Mismatches", recon.get("null_mismatches", "0")))],
-            ], className="dq-card"), lg=4, className="mb-4"),
+            ], className="dq-card", style={"width": "100%", "minWidth": "0", "boxSizing": "border-box"}), lg=4, className="mb-4", style={"minWidth": "0"}),
             dbc.Col(html.Div([
                 html.Div("Check Breakdown", className="dq-card-title"),
-                html.Table([html.Thead(html.Tr([html.Th(h) for h in ("Check", "Source", "Target", "Mismatches", "Status", "Details")])),
-                            html.Tbody(check_rows)], className="clean-table"),
-            ], className="dq-card"), lg=8, className="mb-4"),
+                html.Div(
+                    html.Table([html.Thead(html.Tr([html.Th(h) for h in ("Check", "Source", "Target", "Mismatches", "Status", "Details")])),
+                                html.Tbody(check_rows)], className="clean-table"),
+                    style={"width": "100%", "minWidth": "0", "overflowX": "auto", "boxSizing": "border-box"}
+                ),
+            ], className="dq-card", style={"width": "100%", "minWidth": "0", "boxSizing": "border-box"}), lg=8, className="mb-4", style={"minWidth": "0"}),
         ], className="g-3"),
         dbc.Row([
             dbc.Col(html.Div([
                 html.Div("Mismatched Records (Sample)", className="dq-card-title"),
-                html.Table([html.Thead(html.Tr([html.Th("Business Key"), html.Th("Value"), html.Th("Reason")])),
-                            html.Tbody(sample_rows)], className="clean-table"),
-            ], className="dq-card"), lg=5, className="mb-4"),
+                html.Div(
+                    html.Table([
+                        html.Colgroup([
+                            html.Col(style={"width": "22%"}),
+                            html.Col(style={"width": "43%"}),
+                            html.Col(style={"width": "35%"}),
+                        ]),
+                        html.Thead(html.Tr([
+                            html.Th("Business Key", style={"width": "22%", "boxSizing": "border-box", "padding": "10px 12px"}),
+                            html.Th("Value", style={"width": "43%", "boxSizing": "border-box", "padding": "10px 12px"}),
+                            html.Th("Reason", style={"width": "35%", "boxSizing": "border-box", "padding": "10px 12px"}),
+                        ])),
+                        html.Tbody(sample_rows),
+                    ], className="clean-table recon-mismatch-table", style={"width": "100%", "maxWidth": "100%", "tableLayout": "fixed", "boxSizing": "border-box"}),
+                    className="recon-mismatch-table-wrapper",
+                    style={"width": "100%", "maxWidth": "100%", "minWidth": "0", "overflowX": "auto", "boxSizing": "border-box"}
+                ),
+            ], className="dq-card", style={"width": "100%", "minWidth": "0", "boxSizing": "border-box"}), lg=5, className="mb-4", style={"minWidth": "0"}),
             dbc.Col(html.Div([
                 html.Div("Reconciliation History", className="dq-card-title"),
                 html.Div(html.Table([html.Thead(html.Tr([html.Th(h) for h in (
                     "Execution ID", "Dataset", "Source", "Target", "Missing", "Extra", "Dup Keys", "Col Diff", "Status", "Executed At")])),
-                    html.Tbody(hist_rows)], className="clean-table"), style={"overflowX": "auto"}),
-            ], className="dq-card"), lg=7, className="mb-4"),
+                    html.Tbody(hist_rows)], className="clean-table"), style={"width": "100%", "minWidth": "0", "overflowX": "auto", "boxSizing": "border-box"}),
+            ], className="dq-card", style={"width": "100%", "minWidth": "0", "boxSizing": "border-box"}), lg=7, className="mb-4", style={"minWidth": "0"}),
         ], className="g-3"),
     ])
 

@@ -3215,21 +3215,11 @@ def _alert_rows(df):
             prov = str(a.get("provider") or "").lower()
             recip = str(a.get("recipient_email") or "")
             if "simulat" in prov or "sandbox" in prov or "dev" in prov or prov == "simulator":
-                notif_badge = html.Div([
-                    html.Span([
-                        html.I(className="bi bi-laptop me-1"),
-                        "SIMULATED (Sandbox)"
-                    ], className="badge me-1", style={"backgroundColor": "#FEF3C7", "color": "#92400E", "fontSize": "0.75rem", "fontWeight": "600", "borderRadius": "12px", "padding": "4px 8px"},
-                    title=f"SMTP host not configured in .env. Logged to dq_simulated_emails.log (Target: {recip or 'Project Team'}). Configure SMTP in Email Settings to send real emails."),
-                    dbc.Button(
-                        html.I(className="bi bi-gear-fill"),
-                        id="btn-open-email-config",
-                        size="sm",
-                        color="link",
-                        className="p-0 text-warning",
-                        title="Click to configure real SMTP / Gmail settings",
-                    )
-                ], className="d-flex align-items-center")
+                notif_badge = html.Span([
+                    html.I(className="bi bi-laptop me-1"),
+                    "SIMULATED (Sandbox)"
+                ], className="badge", style={"backgroundColor": "#FEF3C7", "color": "#92400E", "fontSize": "0.75rem", "fontWeight": "600", "borderRadius": "12px", "padding": "4px 8px"},
+                title=f"SMTP host not configured in .env. Logged to dq_simulated_emails.log (Target: {recip or 'Project Team'}). Configure SMTP in .env to send real emails.")
             else:
                 notif_badge = html.Span([
                     html.I(className="bi bi-envelope-check-fill me-1"),
@@ -3374,7 +3364,7 @@ def _render_notif_detail_modal_body(alert_id: int):
             html.Div([
                 html.Span("Resolution Guidance: ", className="fw-bold small text-dark"),
                 html.Span(
-                    "Configure your SMTP server host, port, and credentials in the .env file or click 'Email Configuration & Health Check' to configure and test credentials.",
+                    "Configure your SMTP server host, port, and credentials in the .env file.",
                     className="small text-muted"
                 ),
             ]),
@@ -3416,148 +3406,6 @@ def _render_notif_detail_modal_body(alert_id: int):
     ])
 
 
-def _render_email_config_modal_body():
-    cfg = email_service.get_smtp_config()
-    is_cfg = cfg.get("configured", False)
-    provider = cfg.get("provider", "Not Configured")
-    host = cfg.get("host") or ""
-    port = cfg.get("port", 587)
-    sender = cfg.get("sender") or "dq-alerts@company.com"
-    masked_user = cfg.get("masked_user") or "Not configured"
-    has_pwd = cfg.get("has_password", False)
-    use_tls = cfg.get("use_tls", True)
-    use_ssl = cfg.get("use_ssl", False)
-
-    status_badge = html.Span("CONFIGURED" if is_cfg else "NOT CONFIGURED",
-                             className="badge ms-2",
-                             style={"backgroundColor": "#DCFCE7" if is_cfg else "#FEE2E2",
-                                    "color": "#15803D" if is_cfg else "#DC2626",
-                                    "fontSize": "0.75rem", "fontWeight": "bold"})
-
-    return html.Div([
-        html.Div([
-            html.Div([
-                html.Span([html.I(className="bi bi-shield-lock-fill text-primary me-2"), "Current Notification Service Status"], className="fw-bold text-dark"),
-                status_badge,
-            ], className="d-flex align-items-center justify-content-between mb-3"),
-
-            dbc.Row([
-                dbc.Col([
-                    html.Div("Email Provider:", className="text-muted small"),
-                    html.Div(provider, className="fw-semibold text-dark small"),
-                ], md=4, className="mb-2"),
-                dbc.Col([
-                    html.Div("SMTP Host & Port:", className="text-muted small"),
-                    html.Div(f"{host or '—'}:{port}", className="fw-semibold text-dark font-monospace small"),
-                ], md=4, className="mb-2"),
-                dbc.Col([
-                    html.Div("Sender Address:", className="text-muted small"),
-                    html.Div(sender, className="fw-semibold text-dark font-monospace small"),
-                ], md=4, className="mb-2"),
-                dbc.Col([
-                    html.Div("Authenticated User:", className="text-muted small"),
-                    html.Div(masked_user, className="fw-semibold text-dark font-monospace small"),
-                ], md=4),
-                dbc.Col([
-                    html.Div("Password / Secret:", className="text-muted small"),
-                    html.Div("•••••••• (Configured)" if has_pwd else "Not set", className="text-dark small"),
-                ], md=4),
-                dbc.Col([
-                    html.Div("Encryption:", className="text-muted small"),
-                    html.Div(f"TLS: {'Yes' if use_tls else 'No'} | SSL: {'Yes' if use_ssl else 'No'}", className="text-dark small"),
-                ], md=4),
-            ]),
-
-            (dbc.Alert([
-                html.I(className="bi bi-exclamation-triangle-fill me-2"),
-                "Email notifications are currently failing because SMTP credentials are not set. "
-                "Fill in the form below to configure your SMTP provider or configure environment variables."
-            ], color="warning", className="mt-3 mb-0 py-2 small") if not is_cfg else html.Div()),
-        ], className="p-3 bg-light rounded border mb-3"),
-
-        html.Div([
-            html.Div("Diagnostic Tools & Verification", className="fw-bold text-dark small mb-2"),
-            dbc.Row([
-                dbc.Col([
-                    dbc.Button([html.I(className="bi bi-plug-fill me-1"), "Test SMTP Connection"],
-                               id="btn-test-smtp-conn", color="primary", outline=True, size="sm", className="w-100 fw-semibold"),
-                    html.Div(id="smtp-test-conn-result", className="mt-2"),
-                ], md=6),
-                dbc.Col([
-                    html.Div([
-                        dbc.Input(id="input-test-email-addr", placeholder="Recipient (e.g. manjulamuthu2004@gmail.com)",
-                                  value="manjulamuthu2004@gmail.com", size="sm", className="mb-1"),
-                        dbc.Button([html.I(className="bi bi-send-fill me-1"), "Send Verification Email"],
-                                   id="btn-send-test-email-action", color="success", size="sm", className="w-100 fw-semibold"),
-                    ]),
-                    html.Div(id="smtp-test-email-result", className="mt-2"),
-                ], md=6),
-            ]),
-        ], className="p-3 bg-white rounded border mb-3"),
-
-        html.Div([
-            html.Div([
-                html.Span("Configure / Update SMTP Credentials", className="fw-bold text-dark small"),
-                html.Span("Saved securely to local .env and environment", className="text-muted small"),
-            ], className="d-flex justify-content-between align-items-center mb-2"),
-
-            # Quick Provider Presets
-            html.Div([
-                html.Span("Quick Presets: ", className="small fw-semibold text-secondary me-2"),
-                dbc.ButtonGroup([
-                    dbc.Button([html.I(className="bi bi-google me-1"), "Gmail"], id="btn-preset-gmail", size="sm", outline=True, color="danger", className="py-0 px-2 small"),
-                    dbc.Button([html.I(className="bi bi-microsoft me-1"), "Microsoft 365 / Outlook"], id="btn-preset-outlook", size="sm", outline=True, color="primary", className="py-0 px-2 small"),
-                    dbc.Button([html.I(className="bi bi-envelope-fill me-1"), "Yahoo Mail"], id="btn-preset-yahoo", size="sm", outline=True, color="info", className="py-0 px-2 small"),
-                    dbc.Button([html.I(className="bi bi-send-fill me-1"), "SendGrid SMTP"], id="btn-preset-sendgrid", size="sm", outline=True, color="success", className="py-0 px-2 small"),
-                ], size="sm", className="mb-2"),
-            ], className="d-flex align-items-center mb-2 flex-wrap gap-1"),
-
-            html.Div(id="smtp-preset-hint", children=[
-                html.Div([
-                    html.I(className="bi bi-info-circle-fill text-primary me-2"),
-                    html.Span("Every developer can register their own email provider and password. For Gmail or Yahoo, generate a 16-character App Password from your security settings. For Microsoft 365 or Corporate SMTP, enter your corporate credentials.", className="text-muted small"),
-                ], className="p-2 bg-light rounded border mb-3 small")
-            ]),
-
-            dbc.Row([
-                dbc.Col([
-                    dbc.Label("SMTP Host *", className="small fw-semibold mb-1"),
-                    dbc.Input(id="smtp-cfg-host", placeholder="e.g. smtp.gmail.com", value=host, size="sm"),
-                ], md=6, className="mb-2"),
-                dbc.Col([
-                    dbc.Label("SMTP Port *", className="small fw-semibold mb-1"),
-                    dbc.Input(id="smtp-cfg-port", type="number", placeholder="587", value=port, size="sm"),
-                ], md=3, className="mb-2"),
-                dbc.Col([
-                    dbc.Label("Sender Email *", className="small fw-semibold mb-1"),
-                    dbc.Input(id="smtp-cfg-sender", placeholder="e.g. dq-alerts@company.com", value=sender, size="sm"),
-                ], md=3, className="mb-2"),
-                dbc.Col([
-                    dbc.Label("Username / Email *", className="small fw-semibold mb-1"),
-                    dbc.Input(id="smtp-cfg-user", placeholder="e.g. user@gmail.com", value=cfg.get("user", ""), size="sm"),
-                ], md=6, className="mb-2"),
-                dbc.Col([
-                    dbc.Label("Password / App Password *", className="small fw-semibold mb-1"),
-                    dbc.Input(id="smtp-cfg-pass", type="password", placeholder="Enter SMTP password or App Password", size="sm"),
-                ], md=6, className="mb-2"),
-            ]),
-
-            dbc.Row([
-                dbc.Col([
-                    dbc.Checkbox(id="smtp-cfg-tls", label="Enable STARTTLS (Port 587 recommended)", value=use_tls, className="small me-3"),
-                    dbc.Checkbox(id="smtp-cfg-ssl", label="Enable SSL/TLS (Port 465)", value=use_ssl, className="small"),
-                ], md=8),
-                dbc.Col([
-                    dbc.Button([html.I(className="bi bi-save me-1"), "Save & Apply Settings"],
-                               id="btn-save-smtp-cfg", color="primary", size="sm", className="w-100 fw-semibold"),
-                ], md=4),
-            ], className="align-items-center mt-2"),
-
-            html.Div(id="smtp-cfg-save-alert", className="mt-2"),
-        ], className="p-3 bg-white rounded border"),
-    ])
-
-
 def page_alerts():
     projects = db_adapter.get_projects_list()["project_name"].tolist()
     smtp_cfg = email_service.get_smtp_config()
@@ -3570,11 +3418,7 @@ def page_alerts():
         dcc.Store(id="store-current-notif-alert-id"),
         html.Div([
             html.H3([html.I(className="bi bi-bell text-primary me-2"), "Alerts & Reports"], className="page-main-title mb-0"),
-            html.Div([
-                dbc.Button([html.I(className="bi bi-gear-fill me-2"), "Email Configuration & Health Check"],
-                           id="btn-open-email-config", color="light", size="sm", className="border fw-semibold shadow-sm"),
-            ]),
-        ], className="page-header-bar d-flex justify-content-between align-items-center mb-3"),
+        ], className="page-header-bar mb-3"),
         (dbc.Alert([
             html.Div([
                 html.I(className="bi bi-info-circle-fill text-warning fs-5 me-2"),
@@ -3582,9 +3426,7 @@ def page_alerts():
                     html.Strong("Email Alerts Running in Local Sandbox Simulation: "),
                     "SMTP host is unconfigured in your environment. Notifications are logged locally to ",
                     html.Code("dq_simulated_emails.log"),
-                    ". To receive real alert emails in your Gmail or corporate inbox, click ",
-                    html.Strong("Email Configuration & Health Check"),
-                    " above to configure your SMTP / Google App Password."
+                    ". To receive real alert emails in your Gmail or corporate inbox, configure SMTP credentials in your .env file."
                 ]),
             ], className="d-flex align-items-center"),
         ], color="warning", className="py-2 px-3 mb-3 border-warning-subtle shadow-sm small") if not is_smtp_configured else html.Div()),
@@ -3636,15 +3478,6 @@ def page_alerts():
                 dbc.Button("Close", id="btn-close-notif-detail-modal", color="secondary", outline=True),
             ]),
         ], id="modal-notif-detail", size="lg", is_open=False),
-
-        # Email Configuration & Health Check Modal
-        dbc.Modal([
-            dbc.ModalHeader(dbc.ModalTitle([html.I(className="bi bi-envelope-gear text-primary me-2"), "Email Notification Configuration & Diagnostic Tools"]), close_button=True),
-            dbc.ModalBody(id="email-config-modal-body", children=[html.Div("Loading configuration...")]),
-            dbc.ModalFooter([
-                dbc.Button("Close", id="btn-close-email-config-modal", color="secondary", outline=True),
-            ]),
-        ], id="modal-email-config", size="lg", is_open=False),
     ])
 
 # -------------------------------------------------------------
@@ -7242,173 +7075,6 @@ def handle_modal_retry_notif(n_clicks, alert_id):
             f"Notification retry failed: {err_msg}"
         ], color="danger", className="small py-2 mb-0")
     return feedback, _ts
-
-
-# 8b-3. Email Configuration Modal Open/Close Callback
-@app.callback(
-    [Output("modal-email-config", "is_open"),
-     Output("email-config-modal-body", "children")],
-    [Input("btn-open-email-config", "n_clicks"),
-     Input("btn-close-email-config-modal", "n_clicks")],
-    prevent_initial_call=True,
-)
-def handle_email_config_modal(open_click, close_click):
-    trig = ctx.triggered_id
-    if not trig or not _real_click():
-        return dash.no_update, dash.no_update
-    if trig == "btn-close-email-config-modal":
-        return False, dash.no_update
-    if trig == "btn-open-email-config":
-        body = _render_email_config_modal_body()
-        return True, body
-    return dash.no_update, dash.no_update
-
-
-# 8b-4. Save SMTP Configuration Callback
-@app.callback(
-    Output("smtp-cfg-save-alert", "children"),
-    Input("btn-save-smtp-cfg", "n_clicks"),
-    [State("smtp-cfg-host", "value"),
-     State("smtp-cfg-port", "value"),
-     State("smtp-cfg-sender", "value"),
-     State("smtp-cfg-user", "value"),
-     State("smtp-cfg-pass", "value"),
-     State("smtp-cfg-tls", "value"),
-     State("smtp-cfg-ssl", "value")],
-    prevent_initial_call=True,
-)
-def save_smtp_cfg_callback(n, host, port, sender, user, pwd, tls, ssl):
-    if not n:
-        return dash.no_update
-    if not host or not str(host).strip():
-        return dbc.Alert("SMTP Host is required.", color="danger", className="small py-2 mb-0")
-    try:
-        p_num = int(port or 587)
-    except Exception:
-        return dbc.Alert("Invalid port number.", color="danger", className="small py-2 mb-0")
-
-    success, msg = db_adapter.update_smtp_configuration(
-        host=str(host).strip(),
-        port=p_num,
-        username=str(user or "").strip(),
-        password=str(pwd or "").strip(),
-        sender_email=str(sender or "").strip(),
-        use_tls=bool(tls),
-        use_ssl=bool(ssl),
-        user="admin"
-    )
-    if success:
-        return dbc.Alert([html.I(className="bi bi-check-circle-fill me-2"), msg], color="success", className="small py-2 mb-0")
-    else:
-        return dbc.Alert([html.I(className="bi bi-exclamation-circle-fill me-2"), msg], color="danger", className="small py-2 mb-0")
-
-
-# 8b-4b. Provider Presets Autofill Callback
-@app.callback(
-    [Output("smtp-cfg-host", "value"),
-     Output("smtp-cfg-port", "value"),
-     Output("smtp-cfg-tls", "value"),
-     Output("smtp-cfg-ssl", "value"),
-     Output("smtp-preset-hint", "children")],
-    [Input("btn-preset-gmail", "n_clicks"),
-     Input("btn-preset-outlook", "n_clicks"),
-     Input("btn-preset-yahoo", "n_clicks"),
-     Input("btn-preset-sendgrid", "n_clicks")],
-    prevent_initial_call=True,
-)
-def apply_provider_preset(n_gmail, n_outlook, n_yahoo, n_sendgrid):
-    trig = ctx.triggered_id
-    if not trig or not _real_click():
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
-
-    if trig == "btn-preset-gmail":
-        hint = html.Div([
-            html.I(className="bi bi-google text-danger me-2"),
-            html.Strong("Gmail Preset Applied: "),
-            "Host: smtp.gmail.com (Port 587, STARTTLS). ",
-            html.Span("Google requires a 16-character App Password when 2-Step Verification is enabled. Generate one at myaccount.google.com/apppasswords and paste it into the Password field.", className="text-danger fw-semibold"),
-        ], className="p-2 bg-light rounded border mb-3 small")
-        return "smtp.gmail.com", 587, True, False, hint
-
-    elif trig == "btn-preset-outlook":
-        hint = html.Div([
-            html.I(className="bi bi-microsoft text-primary me-2"),
-            html.Strong("Microsoft 365 / Outlook Preset Applied: "),
-            "Host: smtp.office365.com (Port 587, STARTTLS). Enter your Microsoft email and password or App Password.",
-        ], className="p-2 bg-light rounded border mb-3 small")
-        return "smtp.office365.com", 587, True, False, hint
-
-    elif trig == "btn-preset-yahoo":
-        hint = html.Div([
-            html.I(className="bi bi-envelope-fill text-info me-2"),
-            html.Strong("Yahoo Mail Preset Applied: "),
-            "Host: smtp.mail.yahoo.com (Port 587, STARTTLS). Generate an App Password in your Yahoo Account Security settings.",
-        ], className="p-2 bg-light rounded border mb-3 small")
-        return "smtp.mail.yahoo.com", 587, True, False, hint
-
-    elif trig == "btn-preset-sendgrid":
-        hint = html.Div([
-            html.I(className="bi bi-send-fill text-success me-2"),
-            html.Strong("SendGrid SMTP Preset Applied: "),
-            "Host: smtp.sendgrid.net (Port 587, STARTTLS). Username is 'apikey' and Password is your SendGrid API Key (SG....).",
-        ], className="p-2 bg-light rounded border mb-3 small")
-        return "smtp.sendgrid.net", 587, True, False, hint
-
-    return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
-
-
-# 8b-5. Test SMTP Connection Callback
-@app.callback(
-    Output("smtp-test-conn-result", "children"),
-    Input("btn-test-smtp-conn", "n_clicks"),
-    prevent_initial_call=True,
-)
-def test_smtp_conn_callback(n):
-    if not n:
-        return dash.no_update
-    res = email_service.test_smtp_connection()
-    if res.get("connected"):
-        return dbc.Alert([
-            html.I(className="bi bi-check-circle-fill me-2"),
-            res.get("message", "Connection successful!"),
-        ], color="success", className="small py-2 mb-0")
-    else:
-        return dbc.Alert([
-            html.Div([html.I(className="bi bi-x-circle-fill me-2"), html.Strong(res.get("message"))]),
-            html.Div(f"Diagnostic Hint: {res.get('hint')}", className="text-muted mt-1") if res.get("hint") else html.Div(),
-        ], color="danger", className="small py-2 mb-0")
-
-
-# 8b-6. Send Test Verification Email Callback
-@app.callback(
-    Output("smtp-test-email-result", "children"),
-    Input("btn-send-test-email-action", "n_clicks"),
-    State("input-test-email-addr", "value"),
-    prevent_initial_call=True,
-)
-def send_test_email_callback(n, recipient):
-    if not n:
-        return dash.no_update
-    if not recipient or not str(recipient).strip():
-        return dbc.Alert("Recipient email address is required.", color="danger", className="small py-2 mb-0")
-    res = db_adapter.test_email_delivery(str(recipient).strip(), user="admin")
-    if res.get("success"):
-        provider = res.get("details", {}).get("provider", "")
-        if "simulat" in provider.lower() or "sandbox" in provider.lower() or "dev" in provider.lower():
-            return dbc.Alert([
-                html.I(className="bi bi-info-circle-fill me-2"),
-                html.Span(f"Simulated test email recorded locally for {recipient}. Note: Real SMTP host is not configured; enter SMTP credentials below and click 'Save & Apply Settings' to send real emails to your inbox."),
-            ], color="warning", className="small py-2 mb-0")
-        else:
-            return dbc.Alert([
-                html.I(className="bi bi-check-circle-fill me-2"),
-                res.get("message"),
-            ], color="success", className="small py-2 mb-0")
-    else:
-        return dbc.Alert([
-            html.I(className="bi bi-x-circle-fill me-2"),
-            res.get("message"),
-        ], color="danger", className="small py-2 mb-0")
 
 
 # 8c. Filter Audit Runs on Page 8 (Phase 6)

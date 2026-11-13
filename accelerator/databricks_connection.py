@@ -283,6 +283,10 @@ class DatabricksConnectionManager:
 
                 # Clear and prime dynamic discovery
                 session.clear_cache()
+                try:
+                    self.discover_catalogs(session_id=session.session_id, refresh=True)
+                except Exception as disc_err:
+                    logger.warning(f"Initial catalog discovery warning: {disc_err}")
 
                 # Persist non-sensitive local descriptor for local developer convenience
                 if remember and session.session_id == "default_user":
@@ -379,6 +383,46 @@ class DatabricksConnectionManager:
     # DYNAMIC UNITY CATALOG DISCOVERY
     # -------------------------------------------------------------
 
+    def _execute_sql_discovery(self, session: UserWorkspaceSession, sql_statement: str) -> Optional[List[List[Any]]]:
+        """
+        Executes dynamic discovery SQL statement (SHOW CATALOGS, SHOW SCHEMAS, SHOW TABLES)
+        using the connected Databricks workspace's active SQL warehouse via Statement Execution API.
+        """
+        if not session.client:
+            return None
+        try:
+            wh_id = os.environ.get("DATABRICKS_WAREHOUSE_ID") or session.workspace_info.get("warehouse_id")
+            if not wh_id and hasattr(session.client, "warehouses"):
+                try:
+                    wh_list = list(session.client.warehouses.list())
+                    for w in wh_list:
+                        state = str(getattr(w, "state", "")).upper()
+                        if "RUNNING" in state or "STARTING" in state:
+                            wh_id = getattr(w, "id", None)
+                            break
+                    if not wh_id and wh_list:
+                        wh_id = getattr(wh_list[0], "id", None)
+                    if wh_id:
+                        session.workspace_info["warehouse_id"] = wh_id
+                except Exception as whe:
+                    logger.debug(f"Warehouse discovery skipped: {whe}")
+
+            if not wh_id or not hasattr(session.client, "statement_execution"):
+                return None
+
+            logger.info(f"Executing SQL discovery statement via warehouse {wh_id}: {sql_statement}")
+            resp = session.client.statement_execution.execute_statement(
+                warehouse_id=wh_id,
+                statement=sql_statement,
+                wait_timeout="15s",
+            )
+            if resp and hasattr(resp, "result") and resp.result and hasattr(resp.result, "data_array"):
+                return resp.result.data_array or []
+            return None
+        except Exception as sqle:
+            logger.debug(f"SQL statement execution fallback notice for '{sql_statement}': {sqle}")
+            return None
+
     def discover_catalogs(self, session_id: Optional[str] = None, refresh: bool = False) -> List[Dict[str, Any]]:
         """
         Dynamically queries the connected Databricks workspace for all accessible Unity Catalogs.
@@ -411,11 +455,39 @@ class DatabricksConnectionManager:
                         "owner": str(owner),
                     })
 
+                if not result:
+                    sql_rows = self._execute_sql_discovery(session, "SHOW CATALOGS")
+                    if sql_rows:
+                        for r in sql_rows:
+                            if r and r[0]:
+                                result.append({
+                                    "name": str(r[0]),
+                                    "type": "MANAGED",
+                                    "comment": "",
+                                    "owner": "",
+                                })
+
                 session.catalogs_cache = sorted(result, key=lambda x: x["name"].lower())
+                session.last_error = None
                 return session.catalogs_cache
 
             except Exception as e:
                 logger.warning(f"Error querying live catalogs from Unity Catalog: {e}")
+                sql_rows = self._execute_sql_discovery(session, "SHOW CATALOGS")
+                if sql_rows:
+                    result = []
+                    for r in sql_rows:
+                        if r and r[0]:
+                            result.append({
+                                "name": str(r[0]),
+                                "type": "MANAGED",
+                                "comment": "",
+                                "owner": "",
+                            })
+                    session.catalogs_cache = sorted(result, key=lambda x: x["name"].lower())
+                    session.last_error = None
+                    return session.catalogs_cache
+
                 session.last_error = str(e)
                 return []
 
@@ -459,12 +531,38 @@ class DatabricksConnectionManager:
                         "owner": str(owner),
                     })
 
+                if not result:
+                    sql_rows = self._execute_sql_discovery(session, f"SHOW SCHEMAS IN `{cat}`")
+                    if sql_rows:
+                        for r in sql_rows:
+                            if r and r[0]:
+                                result.append({
+                                    "name": str(r[0]),
+                                    "catalog": cat,
+                                    "comment": "",
+                                    "owner": "",
+                                })
+
                 schemas_sorted = sorted(result, key=lambda x: x["name"].lower())
                 session.schemas_cache[cache_key] = schemas_sorted
                 return schemas_sorted
 
             except Exception as e:
                 logger.warning(f"Error querying schemas for catalog '{cat}': {e}")
+                sql_rows = self._execute_sql_discovery(session, f"SHOW SCHEMAS IN `{cat}`")
+                if sql_rows:
+                    result = []
+                    for r in sql_rows:
+                        if r and r[0]:
+                            result.append({
+                                "name": str(r[0]),
+                                "catalog": cat,
+                                "comment": "",
+                                "owner": "",
+                            })
+                    schemas_sorted = sorted(result, key=lambda x: x["name"].lower())
+                    session.schemas_cache[cache_key] = schemas_sorted
+                    return schemas_sorted
                 return []
 
     def discover_tables(
@@ -511,6 +609,20 @@ class DatabricksConnectionManager:
                         "data_source_format": str(fmt),
                         "is_volume_file": False,
                     })
+
+                if not result:
+                    sql_rows = self._execute_sql_discovery(session, f"SHOW TABLES IN `{cat}`.`{sch}`")
+                    if sql_rows:
+                        for r in sql_rows:
+                            tbl_name = str(r[1] if len(r) > 1 else r[0])
+                            result.append({
+                                "name": tbl_name,
+                                "type": "MANAGED (DELTA)",
+                                "full_name": f"{cat}.{sch}.{tbl_name}",
+                                "comment": "",
+                                "data_source_format": "DELTA",
+                                "is_volume_file": False,
+                            })
 
                 # If no Delta tables exist in this schema, discover Unity Catalog Volumes with raw files
                 if not result:
@@ -981,7 +1093,43 @@ class DatabricksConnectionManager:
             logger.debug(f"Could not save local connection cache: {e}")
 
     def _try_load_local_cache(self):
-        """Attempts to auto-discover local CLI or cached configuration on startup."""
+        """Attempts to auto-discover local CLI, environment, or cached configuration on startup."""
+        # 1. Check environment variables (.env / system environment)
+        host_env = os.environ.get("DATABRICKS_HOST", "").strip()
+        token_env = os.environ.get("DATABRICKS_TOKEN", "").strip()
+
+        if host_env and token_env:
+            try:
+                from databricks.sdk import WorkspaceClient
+                clean_host = self._sanitize_host(host_env)
+                client = WorkspaceClient(host=clean_host, token=token_env)
+                u = client.current_user.me()
+                session = self.get_session("default_user")
+                session.host = clean_host
+                session.client = client
+                session._token = token_env
+                session.token_masked = token_env[:4] + "..." + token_env[-4:] if len(token_env) > 8 else "dapi****"
+                session.connected = True
+                session.auth_type = "Personal Access Token"
+                session.user_info = {
+                    "user_name": getattr(u, "user_name", "") or getattr(u, "display_name", ""),
+                    "display_name": getattr(u, "display_name", ""),
+                }
+                session.workspace_info = {
+                    "host": clean_host,
+                    "cloud_provider": self._detect_cloud_provider(clean_host),
+                }
+                session.connected_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                try:
+                    self.discover_catalogs(session_id="default_user", refresh=True)
+                except Exception:
+                    pass
+                logger.info(f"Auto-connected Databricks via environment: {clean_host}")
+                return
+            except Exception as env_err:
+                logger.debug(f"Environment auto-connect failed: {env_err}")
+
+        # 2. Check local session cache file (pre-fills form for developer convenience)
         if not os.path.exists(_LOCAL_SESSION_CACHE_FILE):
             return
 
@@ -992,7 +1140,6 @@ class DatabricksConnectionManager:
             auth_type = data.get("auth_type", "CLI_PROFILE")
             profile = data.get("profile")
 
-            # In background or non-blocking mode, verify if credentials are still valid
             if host:
                 session = self.get_session("default_user")
                 session.host = host
@@ -1007,10 +1154,18 @@ class DatabricksConnectionManager:
                         client.current_user.me()
                         session.client = client
                         session.connected = True
+                        session.connected_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        try:
+                            self.discover_catalogs(session_id="default_user", refresh=True)
+                        except Exception:
+                            pass
                     except Exception:
-                        pass
-                elif data.get("username"):
-                    session.connected = True
+                        session.connected = False
+                        session.client = None
+                else:
+                    # Without an active client, session is NOT connected
+                    session.connected = False
+                    session.client = None
         except Exception as e:
             logger.debug(f"Could not load local connection cache: {e}")
 

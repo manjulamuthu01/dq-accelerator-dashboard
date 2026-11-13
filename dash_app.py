@@ -3164,7 +3164,25 @@ def _render_email_config_modal_body():
             html.Div([
                 html.Span("Configure / Update SMTP Credentials", className="fw-bold text-dark small"),
                 html.Span("Saved securely to local .env and environment", className="text-muted small"),
-            ], className="d-flex justify-content-between align-items-center mb-3"),
+            ], className="d-flex justify-content-between align-items-center mb-2"),
+
+            # Quick Provider Presets
+            html.Div([
+                html.Span("Quick Presets: ", className="small fw-semibold text-secondary me-2"),
+                dbc.ButtonGroup([
+                    dbc.Button([html.I(className="bi bi-google me-1"), "Gmail"], id="btn-preset-gmail", size="sm", outline=True, color="danger", className="py-0 px-2 small"),
+                    dbc.Button([html.I(className="bi bi-microsoft me-1"), "Microsoft 365 / Outlook"], id="btn-preset-outlook", size="sm", outline=True, color="primary", className="py-0 px-2 small"),
+                    dbc.Button([html.I(className="bi bi-envelope-fill me-1"), "Yahoo Mail"], id="btn-preset-yahoo", size="sm", outline=True, color="info", className="py-0 px-2 small"),
+                    dbc.Button([html.I(className="bi bi-send-fill me-1"), "SendGrid SMTP"], id="btn-preset-sendgrid", size="sm", outline=True, color="success", className="py-0 px-2 small"),
+                ], size="sm", className="mb-2"),
+            ], className="d-flex align-items-center mb-2 flex-wrap gap-1"),
+
+            html.Div(id="smtp-preset-hint", children=[
+                html.Div([
+                    html.I(className="bi bi-info-circle-fill text-primary me-2"),
+                    html.Span("Every developer can register their own email provider and password. For Gmail or Yahoo, generate a 16-character App Password from your security settings. For Microsoft 365 or Corporate SMTP, enter your corporate credentials.", className="text-muted small"),
+                ], className="p-2 bg-light rounded border mb-3 small")
+            ]),
 
             dbc.Row([
                 dbc.Col([
@@ -6703,6 +6721,60 @@ def save_smtp_cfg_callback(n, host, port, sender, user, pwd, tls, ssl):
         return dbc.Alert([html.I(className="bi bi-check-circle-fill me-2"), msg], color="success", className="small py-2 mb-0")
     else:
         return dbc.Alert([html.I(className="bi bi-exclamation-circle-fill me-2"), msg], color="danger", className="small py-2 mb-0")
+
+
+# 8b-4b. Provider Presets Autofill Callback
+@app.callback(
+    [Output("smtp-cfg-host", "value"),
+     Output("smtp-cfg-port", "value"),
+     Output("smtp-cfg-tls", "value"),
+     Output("smtp-cfg-ssl", "value"),
+     Output("smtp-preset-hint", "children")],
+    [Input("btn-preset-gmail", "n_clicks"),
+     Input("btn-preset-outlook", "n_clicks"),
+     Input("btn-preset-yahoo", "n_clicks"),
+     Input("btn-preset-sendgrid", "n_clicks")],
+    prevent_initial_call=True,
+)
+def apply_provider_preset(n_gmail, n_outlook, n_yahoo, n_sendgrid):
+    trig = ctx.triggered_id
+    if not trig or not _real_click():
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+    if trig == "btn-preset-gmail":
+        hint = html.Div([
+            html.I(className="bi bi-google text-danger me-2"),
+            html.Strong("Gmail Preset Applied: "),
+            "Host: smtp.gmail.com (Port 587, STARTTLS). ",
+            html.Span("Google requires a 16-character App Password when 2-Step Verification is enabled. Generate one at myaccount.google.com/apppasswords and paste it into the Password field.", className="text-danger fw-semibold"),
+        ], className="p-2 bg-light rounded border mb-3 small")
+        return "smtp.gmail.com", 587, True, False, hint
+
+    elif trig == "btn-preset-outlook":
+        hint = html.Div([
+            html.I(className="bi bi-microsoft text-primary me-2"),
+            html.Strong("Microsoft 365 / Outlook Preset Applied: "),
+            "Host: smtp.office365.com (Port 587, STARTTLS). Enter your Microsoft email and password or App Password.",
+        ], className="p-2 bg-light rounded border mb-3 small")
+        return "smtp.office365.com", 587, True, False, hint
+
+    elif trig == "btn-preset-yahoo":
+        hint = html.Div([
+            html.I(className="bi bi-envelope-fill text-info me-2"),
+            html.Strong("Yahoo Mail Preset Applied: "),
+            "Host: smtp.mail.yahoo.com (Port 587, STARTTLS). Generate an App Password in your Yahoo Account Security settings.",
+        ], className="p-2 bg-light rounded border mb-3 small")
+        return "smtp.mail.yahoo.com", 587, True, False, hint
+
+    elif trig == "btn-preset-sendgrid":
+        hint = html.Div([
+            html.I(className="bi bi-send-fill text-success me-2"),
+            html.Strong("SendGrid SMTP Preset Applied: "),
+            "Host: smtp.sendgrid.net (Port 587, STARTTLS). Username is 'apikey' and Password is your SendGrid API Key (SG....).",
+        ], className="p-2 bg-light rounded border mb-3 small")
+        return "smtp.sendgrid.net", 587, True, False, hint
+
+    return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
 
 # 8b-5. Test SMTP Connection Callback

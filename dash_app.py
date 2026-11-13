@@ -2326,12 +2326,25 @@ def format_friendly_timestamp(ts_val):
     try:
         dt = None
         s = str(ts_val).strip()
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%d %b %Y, %I:%M %p", "%Y-%m-%d"):
+        formats = (
+            "%d %b %Y, %I:%M %p",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M:%S.%f",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S.%f",
+            "%Y-%m-%d",
+            "%d %b %Y"
+        )
+        for fmt in formats:
             try:
-                dt = datetime.strptime(s[:19], fmt)
+                dt = datetime.strptime(s, fmt)
                 break
             except Exception:
-                pass
+                try:
+                    dt = datetime.strptime(s[:19], fmt)
+                    break
+                except Exception:
+                    pass
         if not dt:
             return s
         now = datetime.now()

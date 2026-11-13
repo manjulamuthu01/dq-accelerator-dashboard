@@ -11,7 +11,7 @@ import logging
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Union
 from flask import request, jsonify
 
@@ -1212,10 +1212,6 @@ def _build_management_table_rows(projects_df):
                        className="text-secondary me-2",
                        style={"textDecoration": "none", "cursor": "pointer", "fontWeight": "600"}),
                 html.Span("|", className="text-muted me-2"),
-                html.A("Add Dataset", href="#", id={"type": "btn-open-add-ds", "id": p_id},
-                       className="text-info me-2",
-                       style={"textDecoration": "none", "cursor": "pointer", "fontWeight": "600"}),
-                html.Span("|", className="text-muted me-2"),
                 html.A(toggle_label, href="#", id={"type": "btn-toggle-proj", "id": p_id},
                        className="text-danger" if is_active else "text-success",
                        style={"textDecoration": "none", "cursor": "pointer", "fontWeight": "600"}),
@@ -1298,31 +1294,36 @@ def page_management():
             ], close_button=True),
             dbc.ModalBody([
                 dbc.Form([
-                    html.Div("PROJECT DETAILS", className="fw-bold text-muted small mb-3", style={"letterSpacing": "0.05em"}),
+                    # ── SECTION 1: PROJECT INFORMATION ───────────────────────────
+                    html.Div("SECTION 1: PROJECT INFORMATION", className="fw-bold text-primary small mb-3", style={"letterSpacing": "0.05em"}),
+                    dbc.Row([
+                        dbc.Col([
+                            dbc.Label(["Project Name ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                            dbc.Input(id="new-project-name", placeholder="e.g. Banking_DQ_Project", type="text", className="rounded-pill px-3 py-2"),
+                        ], md=6, className="mb-3"),
+                        dbc.Col([
+                            dbc.Label("Business Domain / Team", className="small fw-semibold text-secondary mb-1"),
+                            dbc.Input(id="new-project-owner", placeholder="e.g. Risk & Compliance / Data Eng", type="text", className="rounded-pill px-3 py-2"),
+                        ], md=6, className="mb-3"),
+                    ]),
                     html.Div([
-                        dbc.Label("Project Name *", className="small fw-semibold text-secondary mb-1"),
-                        dbc.Input(id="new-project-name", placeholder="e.g. Banking_DQ_Project", type="text", className="rounded-pill px-3 py-2"),
+                        dbc.Label("Project Description", className="small fw-semibold text-secondary mb-1"),
+                        dbc.Input(id="new-project-desc", placeholder="Describe the purpose, scope, and SLA of this DQ project", type="text", className="rounded-pill px-3 py-2"),
                     ], className="mb-3"),
-                    html.Div([
-                        dbc.Label("Description", className="small fw-semibold text-secondary mb-1"),
-                        dbc.Input(id="new-project-desc", placeholder="Customer transaction data quality validation", type="text", className="rounded-pill px-3 py-2"),
-                    ], className="mb-3"),
-                    html.Div([
-                        dbc.Label("Project Owner", className="small fw-semibold text-secondary mb-1"),
-                        dbc.Input(id="new-project-owner", placeholder="Team or owner name", type="text", className="rounded-pill px-3 py-2"),
-                    ], className="mb-4"),
 
-                    html.Div("PROJECT NOTIFICATION DETAILS", className="fw-bold text-muted small mb-3", style={"letterSpacing": "0.05em"}),
-                    html.Div([
-                        dbc.Label("Project Team Email Address *", className="small fw-semibold text-secondary mb-1"),
-                        dbc.Input(id="new-project-team-email", placeholder="e.g. dataquality-team@company.com", type="email", className="rounded-pill px-3 py-2"),
-                        html.Small("Primary notification recipient (Mandatory). Comma-separated if multiple.", className="text-muted small"),
-                    ], className="mb-3"),
-                    html.Div([
-                        dbc.Label("Additional Notification Emails (Optional)", className="small fw-semibold text-secondary mb-1"),
-                        dbc.Input(id="new-project-additional-emails", placeholder="e.g. alerts-oncall@company.com, lead@company.com", type="text", className="rounded-pill px-3 py-2"),
-                        html.Small("Optional secondary stakeholders who receive failure alerts.", className="text-muted small"),
-                    ], className="mb-3"),
+                    # Project Notifications
+                    dbc.Row([
+                        dbc.Col([
+                            dbc.Label(["Project Team Email Address ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                            dbc.Input(id="new-project-team-email", placeholder="e.g. risk-team@company.com", type="email", className="rounded-pill px-3 py-2"),
+                            html.Small("Primary notification recipient (Mandatory). Comma-separated if multiple.", className="text-muted small"),
+                        ], md=6, className="mb-3"),
+                        dbc.Col([
+                            dbc.Label("Additional Notification Emails (Optional)", className="small fw-semibold text-secondary mb-1"),
+                            dbc.Input(id="new-project-additional-emails", placeholder="e.g. alerts-oncall@company.com, lead@company.com", type="text", className="rounded-pill px-3 py-2"),
+                            html.Small("Optional secondary stakeholders who receive failure alerts.", className="text-muted small"),
+                        ], md=6, className="mb-3"),
+                    ]),
                     html.Div([
                         dbc.Checklist(
                             options=[{"label": " Enable Email Notifications for DQ Failures", "value": "enabled"}],
@@ -1333,38 +1334,179 @@ def page_management():
                         ),
                     ], className="mb-4"),
 
-                    html.Div("INITIAL DATASET DETAILS", className="fw-bold text-muted small mb-3", style={"letterSpacing": "0.05em"}),
+                    # ── SECTION 2: INITIAL DATASET REGISTRATION (REQUIRED) ─────────
                     html.Div([
-                        dbc.Label("Dataset Name (Optional)", className="small fw-semibold text-secondary mb-1"),
-                        dbc.Input(id="new-project-dataset-name", placeholder="Leave blank to use table name", type="text", className="rounded-pill px-3 py-2"),
-                    ], className="mb-3"),
-                    html.Div([
-                        dbc.Label("Source Table *", className="small fw-semibold text-secondary mb-1"),
-                        dbc.Input(id="new-project-source-table", placeholder="catalog.schema.source_table", type="text", className="rounded-pill px-3 py-2"),
-                    ], className="mb-3"),
-                    html.Div([
-                        dbc.Label("Target Table (Optional for Reconciliation)", className="small fw-semibold text-secondary mb-1"),
-                        dbc.Input(id="new-project-target-table", placeholder="catalog.schema.target_table", type="text", className="rounded-pill px-3 py-2"),
-                    ], className="mb-3"),
-                    html.Div([
-                        dbc.Label("Business Key", className="small fw-semibold text-secondary mb-1"),
-                        dbc.Input(id="new-project-business-key", placeholder="e.g. customer_id", type="text", className="rounded-pill px-3 py-2"),
-                    ], className="mb-3"),
+                        html.Span("SECTION 2: INITIAL DATASET REGISTRATION", className="fw-bold text-primary small me-2", style={"letterSpacing": "0.05em"}),
+                        html.Span("(Required — Onboard your first dataset)", className="badge bg-primary-subtle text-primary small fw-semibold"),
+                    ], className="d-flex align-items-center mb-3"),
 
-                    html.Div([
-                        dbc.Button([
-                            html.I(className="bi bi-check2-circle me-1"),
-                            "Test Connectivity"
-                        ], id="btn-test-connectivity", color="outline-secondary", size="sm", className="rounded-pill px-3"),
-                        html.Div(id="connectivity-test-alert", className="mt-2"),
-                    ], className="mb-3"),
+                    dcc.Store(id="init-upload-file-store"),
 
-                    html.Div(id="add-project-result-alert"),
+                    # Method Selection Cards
+                    dbc.RadioItems(
+                        id="init-dataset-reg-method",
+                        className="btn-group w-100 mb-3",
+                        inputClassName="btn-check",
+                        labelClassName="btn btn-outline-primary py-2 px-3 text-start rounded-3 me-2",
+                        labelCheckedClassName="active shadow-sm",
+                        options=[
+                            {
+                                "label": html.Div([
+                                    html.Div([
+                                        html.I(className="bi bi-cloud-arrow-up-fill fs-6 me-2 text-primary"),
+                                        html.Span("Option 1: Upload Dataset", className="fw-bold small"),
+                                        html.Span("Recommended for new users", className="badge bg-primary text-white ms-2", style={"fontSize": "0.7rem"}),
+                                    ], className="d-flex align-items-center mb-1"),
+                                    html.Div("Upload a file from your computer (CSV, JSON, Parquet, Excel).", className="small text-muted", style={"fontSize": "0.75rem"}),
+                                ]),
+                                "value": "upload"
+                            },
+                            {
+                                "label": html.Div([
+                                    html.Div([
+                                        html.I(className="bi bi-table fs-6 me-2 text-secondary"),
+                                        html.Span("Option 2: Existing Databricks Table", className="fw-bold small"),
+                                        html.Span("For existing datasets", className="badge bg-secondary text-white ms-2", style={"fontSize": "0.7rem"}),
+                                    ], className="d-flex align-items-center mb-1"),
+                                    html.Div("Register a Delta table or Volume dataset in Unity Catalog.", className="small text-muted", style={"fontSize": "0.75rem"}),
+                                ]),
+                                "value": "existing"
+                            },
+                        ],
+                        value="upload",
+                    ),
+
+                    # ── Option 1: File Upload Container ──
+                    html.Div(id="init-container-upload-dataset", children=[
+                        dcc.Upload(
+                            id="init-upload-dataset-file",
+                            children=html.Div([
+                                html.I(className="bi bi-cloud-arrow-up text-primary mb-1 fs-3"),
+                                html.Div([
+                                    html.Span("Drag and drop your initial dataset file here, or ", className="text-secondary fw-semibold small"),
+                                    html.Span("Browse Computer", className="text-primary fw-bold small text-decoration-underline"),
+                                ]),
+                                html.Div("Supported: CSV, JSON, Parquet, Excel (.xlsx, .xls) • Max 50MB", className="text-muted", style={"fontSize": "0.72rem"}),
+                            ], className="text-center p-3"),
+                            style={
+                                "borderWidth": "2px",
+                                "borderStyle": "dashed",
+                                "borderColor": "#3B82F6",
+                                "borderRadius": "10px",
+                                "backgroundColor": "#F8FAFC",
+                                "cursor": "pointer",
+                            },
+                            multiple=False,
+                        ),
+                        html.Div(id="init-upload-preview-container", className="mt-2"),
+                        html.Div([
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.Label(["Dataset Name ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                                    dbc.Input(id="init-input-upload-dataset-name", placeholder="e.g. Transactions_Master", type="text", className="rounded-pill px-3 py-2"),
+                                ], md=6, className="mb-2"),
+                                dbc.Col([
+                                    dbc.Label(["Business Key Column ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                                    dbc.Select(id="init-select-upload-business-key", placeholder="Select business key...", options=[], className="rounded-pill px-3 py-2"),
+                                ], md=6, className="mb-2"),
+                            ]),
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.Label(["Destination Catalog ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                                    dbc.Input(id="init-input-upload-catalog", placeholder="e.g. hospital_catalog", value="hospital_catalog", type="text", className="rounded-pill px-3 py-2"),
+                                ], md=4, className="mb-2"),
+                                dbc.Col([
+                                    dbc.Label(["Destination Schema ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                                    dbc.Input(id="init-input-upload-schema", placeholder="e.g. healthcare", value="healthcare", type="text", className="rounded-pill px-3 py-2"),
+                                ], md=4, className="mb-2"),
+                                dbc.Col([
+                                    dbc.Label(["Table Name ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                                    dbc.Input(id="init-input-upload-table-name", placeholder="e.g. transactions_source", type="text", className="rounded-pill px-3 py-2"),
+                                ], md=4, className="mb-2"),
+                            ]),
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.Label("Target Table (Optional for Reconciliation)", className="small fw-semibold text-secondary mb-1"),
+                                    dbc.Input(id="init-input-upload-target-table", placeholder="catalog.schema.transactions_target", type="text", className="rounded-pill px-3 py-2"),
+                                ], md=6, className="mb-2"),
+                                dbc.Col([
+                                    dbc.Label("Dataset Description", className="small fw-semibold text-secondary mb-1"),
+                                    dbc.Input(id="init-input-upload-description", placeholder="Primary transactional feed", type="text", className="rounded-pill px-3 py-2"),
+                                ], md=6, className="mb-2"),
+                            ]),
+                        ], className="mt-2"),
+                    ]),
+
+                    # ── Option 2: Existing Table Container ──
+                    html.Div(id="init-container-existing-dataset", style={"display": "none"}, children=[
+                        html.Div(id="init-modal-connection-bar-container", children=_render_modal_connection_bar()),
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Label(["Catalog ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                                dbc.Select(
+                                    id="init-select-existing-catalog",
+                                    options=_get_initial_catalog_options(),
+                                    value=None,
+                                    placeholder="Select Catalog...",
+                                    className="rounded-pill px-3 py-2",
+                                ),
+                            ], md=4, className="mb-2"),
+                            dbc.Col([
+                                dbc.Label(["Schema ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                                dbc.Select(
+                                    id="init-select-existing-schema",
+                                    options=[],
+                                    value=None,
+                                    placeholder="Select Schema...",
+                                    className="rounded-pill px-3 py-2",
+                                ),
+                            ], md=4, className="mb-2"),
+                            dbc.Col([
+                                dbc.Label(["Existing Table / Dataset ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                                dbc.Select(
+                                    id="init-select-existing-table",
+                                    options=[],
+                                    value=None,
+                                    placeholder="Select Table...",
+                                    className="rounded-pill px-3 py-2",
+                                ),
+                            ], md=4, className="mb-2"),
+                        ]),
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Label(["Dataset Name ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                                dbc.Input(id="init-input-existing-dataset-name", placeholder="e.g. Transactions_UC", type="text", className="rounded-pill px-3 py-2"),
+                            ], md=6, className="mb-2"),
+                            dbc.Col([
+                                dbc.Label(["Business Key Column ", html.Span("*", className="text-danger")], className="small fw-semibold text-secondary mb-1"),
+                                dbc.Select(
+                                    id="init-select-existing-business-key",
+                                    options=[],
+                                    value=None,
+                                    placeholder="Select Business Key...",
+                                    className="rounded-pill px-3 py-2",
+                                ),
+                            ], md=6, className="mb-2"),
+                        ]),
+                        html.Div(id="init-existing-table-preview-container", className="mb-2"),
+                        dbc.Row([
+                            dbc.Col([
+                                dbc.Label("Target Table (Optional for Reconciliation)", className="small fw-semibold text-secondary mb-1"),
+                                dbc.Input(id="init-input-existing-target-table", placeholder="catalog.schema.reconcile_target", type="text", className="rounded-pill px-3 py-2"),
+                            ], md=6, className="mb-2"),
+                            dbc.Col([
+                                dbc.Label("Dataset Description", className="small fw-semibold text-secondary mb-1"),
+                                dbc.Input(id="init-input-existing-description", placeholder="Unity Catalog source dataset", type="text", className="rounded-pill px-3 py-2"),
+                            ], md=6, className="mb-2"),
+                        ]),
+                    ]),
+
+                    html.Div(id="add-project-result-alert", className="mt-3"),
                 ]),
             ]),
             dbc.ModalFooter([
                 dbc.Button("Cancel", id="btn-cancel-add-project", color="light", className="rounded-pill px-4"),
-                dbc.Button("Create Project", id="btn-submit-add-project", color="primary", className="rounded-pill px-4 fw-semibold"),
+                dbc.Button([html.I(className="bi bi-check2-circle me-1"), "Create Project & Register Initial Dataset"], id="btn-submit-add-project", color="primary", className="rounded-pill px-4 fw-semibold"),
             ]),
         ], id="modal-add-project", is_open=False, size="lg"),
 
@@ -2177,6 +2319,35 @@ def _render_schedules_table(project_name=None, dataset_name=None, status=None):
     return rows
 
 
+def format_friendly_timestamp(ts_val):
+    """Formats timestamps friendly: 'Today, 11:38 AM', 'Yesterday, 10:20 AM', or '12 Nov 2026, 09:30 AM'."""
+    if not ts_val or str(ts_val).strip() in ("—", "", "None", "nan"):
+        return "—"
+    try:
+        dt = None
+        s = str(ts_val).strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%d %b %Y, %I:%M %p", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(s[:19], fmt)
+                break
+            except Exception:
+                pass
+        if not dt:
+            return s
+        now = datetime.now()
+        today = now.date()
+        yesterday = today - timedelta(days=1)
+        t_str = dt.strftime("%I:%M %p").lstrip("0")
+        if dt.date() == today:
+            return f"Today, {t_str}"
+        elif dt.date() == yesterday:
+            return f"Yesterday, {t_str}"
+        else:
+            return f"{dt.strftime('%d %b %Y')}, {t_str}"
+    except Exception:
+        return str(ts_val)
+
+
 def _render_history_table(project_name=None, dataset_name=None, trigger_type=None, status_filter=None, search=None):
     """Builds the execution history table rows from dq_execution_summary with rich filtering."""
     try:
@@ -2230,7 +2401,10 @@ def _render_history_table(project_name=None, dataset_name=None, trigger_type=Non
                        color="link", size="sm", className="p-1 text-secondary", title="Download Results CSV"),
         ], className="d-flex align-items-center justify-content-center")
 
+        friendly_dt = format_friendly_timestamp(r.get("started_at", "—"))
+
         rows.append(html.Tr([
+            html.Td(friendly_dt, style={"fontWeight": "600", "fontSize": "0.82rem", "whiteSpace": "nowrap"}),
             html.Td(exec_id, style={"fontWeight": "600", "fontSize": "0.78rem", "fontFamily": "monospace"}),
             html.Td(str(r.get("project_name", "—")), className="small"),
             html.Td(str(r.get("dataset_name", "—")), className="small"),
@@ -2238,7 +2412,6 @@ def _render_history_table(project_name=None, dataset_name=None, trigger_type=Non
             html.Td(html.Span(rules_str, className="small fw-semibold")),
             html.Td(html.Span(s, className=badge_cls)),
             html.Td(score_str, className="fw-bold small"),
-            html.Td(str(r.get("started_at", "—")), style={"fontSize": "0.78rem"}),
             html.Td(str(r.get("duration", "—")), className="small"),
             html.Td(actions, className="text-center"),
         ]))
@@ -2309,15 +2482,7 @@ def page_execution():
             dbc.Row([
                 dbc.Col([
                     html.Div(id="exec-active-rules-summary", className="small text-muted ps-1 fw-semibold"),
-                ], md=7),
-                dbc.Col([
-                    html.Div([
-                        html.Span([
-                            html.I(className="bi bi-lightning-charge-fill text-warning me-1"),
-                            "Parallel Engine: 4 Concurrent Worker Threads"
-                        ], className="badge bg-dark text-white px-3 py-2 small shadow-sm"),
-                    ], className="text-md-end"),
-                ], md=5),
+                ], md=12),
             ], className="align-items-center mb-3"),
         ]),
 
@@ -2447,29 +2612,12 @@ def page_execution():
                     dbc.Label("Custom 5-Part Cron Expression (Min Hour Day Month DOW) *", className="small fw-semibold"),
                     dbc.Input(id="sched-input-cron", placeholder="0 8 * * 1-5", size="sm", className="mb-2"),
                 ]),
-                # Concurrency policy & Save action
-                dbc.Row([
-                    dbc.Col([
-                        dbc.Label("Overlap / Concurrency Policy", className="small fw-semibold"),
-                        dbc.Select(
-                            id="sched-select-concurrency",
-                            options=[
-                                {"label": "SKIP (Skip if an existing validation is still running)", "value": "SKIP"},
-                                {"label": "QUEUE (Wait in queue until previous run completes)", "value": "QUEUE"},
-                                {"label": "PARALLEL (Execute concurrently)", "value": "PARALLEL"},
-                            ],
-                            value="SKIP",
-                            size="sm",
-                        ),
-                    ], md=6, className="mb-2"),
-                    dbc.Col([
-                        html.Div([
-                            dbc.Button([html.I(className="bi bi-check2-circle me-1"), "Save & Activate Schedule"],
-                                       id="btn-save-schedule", color="primary", size="sm", className="me-2 px-3"),
-                            dbc.Button("Reset", id="btn-reset-schedule", color="light", size="sm", className="border"),
-                        ], className="pt-4 text-md-end"),
-                    ], md=6),
-                ]),
+                # Save & Reset Actions
+                html.Div([
+                    dbc.Button([html.I(className="bi bi-check2-circle me-1"), "Save & Activate Schedule"],
+                               id="btn-save-schedule", color="primary", size="sm", className="me-2 px-3 fw-semibold"),
+                    dbc.Button("Reset", id="btn-reset-schedule", color="light", size="sm", className="border"),
+                ], className="d-flex justify-content-end mt-3"),
                 html.Div(id="sched-feedback-msg", className="mt-2 small"),
             ], className="p-3 mb-3 bg-white border rounded shadow-sm"),
         ]),
@@ -2519,29 +2667,6 @@ def page_execution():
                 ], className="dq-table w-100"),
             ], style={"overflowX": "auto"}),
         ]),
-
-        # ── Databricks Job Banner ─────────────────────────────────────────────
-        html.Div([
-            dbc.Row([
-                dbc.Col([
-                    html.Div([
-                        html.I(className="bi bi-cpu-fill text-primary me-2 fs-5"),
-                        html.Span(f"Databricks Workflow Job #{db_adapter.DQ_JOB_ID}",
-                                  style={"fontWeight": "700", "fontSize": "0.95rem"}),
-                    ]),
-                    html.Div("Automated multi-task orchestrator with retry policy (2 retries, 60s backoff) & persistent schedule trigger.",
-                             className="text-muted small"),
-                ], md=7),
-                dbc.Col([
-                    html.Div([
-                        html.Span("Trigger: ", className="text-muted small"),
-                        html.Span("Scheduled & Manual", className="badge-pass me-2", style={"fontSize": "0.75rem"}),
-                        html.Span("Schedule: ", className="text-muted small"),
-                        html.Span("Persistent Background Daemon", className="badge-active", style={"fontSize": "0.75rem"}),
-                    ], className="text-md-end pt-1"),
-                ], md=5),
-            ], className="align-items-center"),
-        ], className="p-3 mb-3 rounded bg-white border shadow-sm"),
 
         # ── Pipeline Stepper Card ─────────────────────────────────────────────
         html.Div([
@@ -2643,6 +2768,14 @@ def page_execution():
                     dbc.Col([
                         html.Div([
                             dbc.Select(
+                                id="exec-hist-filter-project",
+                                options=[{"label": "Project: All", "value": "All"}] + [{"label": p, "value": p} for p in projects],
+                                value="All",
+                                size="sm",
+                                style={"width": "145px"},
+                                className="me-2 d-inline-block",
+                            ),
+                            dbc.Select(
                                 id="exec-hist-filter-trigger",
                                 options=[
                                     {"label": "Trigger: All", "value": "All"},
@@ -2651,7 +2784,7 @@ def page_execution():
                                 ],
                                 value="All",
                                 size="sm",
-                                style={"width": "130px"},
+                                style={"width": "120px"},
                                 className="me-2 d-inline-block",
                             ),
                             dbc.Select(
@@ -2664,14 +2797,14 @@ def page_execution():
                                 ],
                                 value="All",
                                 size="sm",
-                                style={"width": "130px"},
+                                style={"width": "120px"},
                                 className="me-2 d-inline-block",
                             ),
                             dbc.Input(
                                 id="exec-hist-search",
-                                placeholder="Search ID, project...",
+                                placeholder="Search ID, dataset...",
                                 size="sm",
-                                style={"width": "180px"},
+                                style={"width": "170px"},
                                 className="d-inline-block",
                             ),
                         ], className="text-md-end"),
@@ -2681,6 +2814,7 @@ def page_execution():
             html.Div([
                 html.Table([
                     html.Thead(html.Tr([
+                        html.Th("Execution Date & Time"),
                         html.Th("Execution ID", style={"fontSize": "0.8rem"}),
                         html.Th("Project"),
                         html.Th("Dataset"),
@@ -2688,7 +2822,6 @@ def page_execution():
                         html.Th("Rules (Pass/Total)"),
                         html.Th("Status"),
                         html.Th("DQ Score"),
-                        html.Th("Started At", style={"fontSize": "0.8rem"}),
                         html.Th("Duration"),
                         html.Th("Actions", className="text-center"),
                     ]), className="table-header"),
@@ -3935,51 +4068,182 @@ def render_page(pathname):
      Output("new-project-team-email", "value"),
      Output("new-project-additional-emails", "value"),
      Output("new-project-notif-enabled", "value"),
-     Output("new-project-source-table", "value"),
-     Output("new-project-target-table", "value"),
-     Output("new-project-business-key", "value")],
+     Output("init-input-upload-dataset-name", "value"),
+     Output("init-input-upload-table-name", "value")],
     Input("btn-autofill-example", "n_clicks"),
     prevent_initial_call=True,
 )
 def handle_autofill_example(n_clicks):
     return (
-        "Banking",
-        "Customer transaction data quality",
-        "Data Engineering Team",
-        "banking-dq-team@company.com",
+        "Banking_Operations",
+        "Customer transaction and payment data quality monitoring",
+        "Risk & Analytics Team",
+        "banking-dq@company.com",
         "alerts-oncall@company.com",
         ["enabled"],
-        "banking_catalog.finance.customer_source",
-        "banking_catalog.finance.customer_target",
-        "customer_id",
+        "Customer_Transactions",
+        "customer_transactions_source",
     )
 
-# 2. Test Table Connectivity
+
+# 2. Add Project: Toggle between Upload and Existing Dataset containers
 @app.callback(
-    Output("connectivity-test-alert", "children"),
-    Input("btn-test-connectivity", "n_clicks"),
-    [State("new-project-source-table", "value"),
-     State("new-project-target-table", "value"),
-     State("new-project-business-key", "value")],
+    [Output("init-container-upload-dataset", "style"),
+     Output("init-container-existing-dataset", "style")],
+    Input("init-dataset-reg-method", "value"),
+    prevent_initial_call=False,
+)
+def toggle_init_dataset_method(method):
+    if method == "existing":
+        return {"display": "none"}, {"display": "block"}
+    return {"display": "block"}, {"display": "none"}
+
+
+# 3. Add Project: Handle Initial Dataset File Upload
+@app.callback(
+    [Output("init-upload-preview-container", "children"),
+     Output("init-input-upload-dataset-name", "value", allow_duplicate=True),
+     Output("init-input-upload-table-name", "value", allow_duplicate=True),
+     Output("init-select-upload-business-key", "options"),
+     Output("init-select-upload-business-key", "value"),
+     Output("init-upload-file-store", "data")],
+    [Input("init-upload-dataset-file", "contents"),
+     Input("init-upload-dataset-file", "filename")],
     prevent_initial_call=True,
 )
-def handle_test_connectivity(n_clicks, src_table, tgt_table, b_key):
-    if not src_table or not src_table.strip():
-        return dbc.Alert("Please provide a Source Table before testing connectivity.", color="warning", className="small py-2 mb-0")
-    
-    res = db_adapter.test_table_connectivity(src_table.strip(), (tgt_table or "").strip() or None, (b_key or "").strip() or None)
-    if res["success"]:
-        return dbc.Alert([
-            html.I(className="bi bi-check-circle-fill me-2"),
-            res["message"]
-        ], color="success", className="small py-2 mb-0")
-    else:
-        return dbc.Alert([
-            html.I(className="bi bi-x-circle-fill me-2"),
-            res["message"]
-        ], color="danger", className="small py-2 mb-0")
+def on_init_file_uploaded(contents, filename):
+    if not contents or not filename:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
-# 3. Add Project & Dataset Registration
+    parsed = db_adapter.parse_uploaded_file(contents, filename)
+    if not parsed.get("success"):
+        err_box = dbc.Alert([
+            html.I(className="bi bi-exclamation-triangle-fill me-2"),
+            parsed.get("message", "Error parsing uploaded file.")
+        ], color="danger", className="py-2")
+        return err_box, dash.no_update, dash.no_update, [], None, None
+
+    cols = parsed["columns"]
+    total_rows = parsed["total_rows"]
+    fmt = parsed["file_format"]
+    schema_info = parsed["schema_info"]
+    preview_rows = parsed["preview_rows"]
+
+    type_badges = [
+        html.Span([
+            html.Span(s["column"], className="fw-semibold text-dark me-1"),
+            html.Span(s["sql_type"], className="badge bg-light text-secondary border me-2 small"),
+        ], className="d-inline-flex align-items-center mb-1")
+        for s in schema_info
+    ]
+
+    preview_table = html.Div([
+        html.Table([
+            html.Thead(html.Tr([html.Th(c, style={"fontSize": "0.78rem", "backgroundColor": "#f8fafc"}) for c in cols])),
+            html.Tbody([
+                html.Tr([html.Td(str(row.get(c, "")), style={"fontSize": "0.75rem", "whiteSpace": "nowrap"}) for c in cols])
+                for row in preview_rows[:5]
+            ]),
+        ], className="table table-sm table-striped table-bordered mb-0"),
+    ], style={"overflowX": "auto", "maxHeight": "180px"})
+
+    preview_ui = html.Div([
+        html.Div([
+            html.Span([html.I(className="bi bi-file-earmark-check me-1"), filename], className="badge bg-success-subtle text-success border border-success me-2 px-2 py-1"),
+            html.Span([html.I(className="bi bi-tag me-1"), fmt], className="badge bg-primary-subtle text-primary border border-primary me-2 px-2 py-1"),
+            html.Span([html.I(className="bi bi-list-ol me-1"), f"{total_rows:,} records"], className="badge bg-info-subtle text-info border border-info me-2 px-2 py-1"),
+            html.Span([html.I(className="bi bi-layout-three-columns me-1"), f"{len(cols)} columns detected"], className="badge bg-secondary-subtle text-secondary border me-2 px-2 py-1"),
+        ], className="d-flex flex-wrap align-items-center mb-2"),
+        html.Div(type_badges, className="p-2 bg-light rounded border mb-2 small"),
+        html.Div(preview_table, className="border rounded bg-white p-2"),
+    ], className="p-2 bg-white rounded border mb-2")
+
+    import re
+    base_name = os.path.splitext(filename)[0]
+    clean_base = re.sub(r'[^a-zA-Z0-9_]', '_', base_name).strip('_')
+    ds_suggest = clean_base.capitalize()
+    tbl_suggest = f"{clean_base.lower()}_source"
+
+    candidates = [c for c in cols if c.lower() in ("id", "key", "pk", "uuid") or c.lower().endswith(("_id", "_key", "_no", "_code"))]
+    b_opts = [{"label": f"{c}" + (" [Key Candidate]" if c in candidates else ""), "value": c} for c in cols]
+    def_bkey = candidates[0] if candidates else (cols[0] if cols else None)
+
+    file_store = {
+        "filename": filename,
+        "contents": contents,
+        "format": fmt,
+        "total_rows": total_rows,
+        "columns": cols,
+    }
+    return preview_ui, ds_suggest, tbl_suggest, b_opts, def_bkey, file_store
+
+
+# 4. Add Project: Option 2 Cascading Discovery
+@app.callback(
+    [Output("init-select-existing-schema", "options"),
+     Output("init-select-existing-schema", "value")],
+    Input("init-select-existing-catalog", "value"),
+    prevent_initial_call=True,
+)
+def load_init_schemas(cat):
+    if not cat:
+        return [], None
+    schemas = db_adapter.get_unity_schemas(cat)
+    opts = [{"label": s["name"] if isinstance(s, dict) else str(s), "value": s["name"] if isinstance(s, dict) else str(s)} for s in schemas]
+    val = opts[0]["value"] if opts else None
+    return opts, val
+
+
+@app.callback(
+    [Output("init-select-existing-table", "options"),
+     Output("init-select-existing-table", "value")],
+    [Input("init-select-existing-schema", "value"),
+     Input("init-select-existing-catalog", "value")],
+    prevent_initial_call=True,
+)
+def load_init_tables(sch, cat):
+    if not cat or not sch:
+        return [], None
+    tables = db_adapter.get_unity_tables(cat, sch)
+    opts = []
+    tbl_names = []
+    for t in tables:
+        name = t["name"] if isinstance(t, dict) else str(t)
+        tbl_names.append(name)
+        tbl_type = f" ({t.get('type')})" if isinstance(t, dict) and t.get('type') else ""
+        opts.append({"label": f"{name}{tbl_type}", "value": name})
+    val = tbl_names[0] if tbl_names else None
+    if not opts:
+        opts = [{"label": f"ℹ️ 0 tables in '{cat}.{sch}'", "value": "", "disabled": True}]
+        val = None
+    return opts, val
+
+
+@app.callback(
+    [Output("init-select-existing-business-key", "options"),
+     Output("init-select-existing-business-key", "value"),
+     Output("init-input-existing-dataset-name", "value"),
+     Output("init-existing-table-preview-container", "children")],
+    Input("init-select-existing-table", "value"),
+    [State("init-select-existing-catalog", "value"),
+     State("init-select-existing-schema", "value")],
+    prevent_initial_call=True,
+)
+def on_init_table_selected(tbl, cat, sch):
+    if not cat or not sch or not tbl:
+        return [], None, dash.no_update, html.Div()
+    meta = db_adapter.get_unity_table_metadata(cat, sch, tbl)
+    cols = meta.get("columns", [])
+    b_cand = meta.get("business_key_candidates", [])
+    schema_map = {s.get("column"): s.get("sql_type", "STRING") for s in meta.get("schema_info", [])}
+    col_opts = [{"label": f"{c} ({schema_map.get(c, 'STRING')})" + (" [Key Candidate]" if c in b_cand else ""), "value": c} for c in cols]
+    def_key = b_cand[0] if b_cand else (cols[0] if cols else None)
+    ds_name = tbl
+    preview_ui = _build_table_preview_card(meta)
+    return col_opts, def_key, ds_name, preview_ui
+
+
+# 5. Add Project & Atomic Dataset Registration Callback
 @app.callback(
     [Output("modal-add-project", "is_open"),
      Output("add-project-result-alert", "children"),
@@ -3997,58 +4261,102 @@ def handle_test_connectivity(n_clicks, src_table, tgt_table, b_key):
      State("new-project-team-email", "value"),
      State("new-project-additional-emails", "value"),
      State("new-project-notif-enabled", "value"),
-     State("new-project-source-table", "value"),
-     State("new-project-target-table", "value"),
-     State("new-project-business-key", "value"),
-     State("new-project-dataset-name", "value")],
+     State("init-dataset-reg-method", "value"),
+     State("init-upload-file-store", "data"),
+     State("init-input-upload-dataset-name", "value"),
+     State("init-input-upload-catalog", "value"),
+     State("init-input-upload-schema", "value"),
+     State("init-input-upload-table-name", "value"),
+     State("init-select-upload-business-key", "value"),
+     State("init-input-upload-target-table", "value"),
+     State("init-input-upload-description", "value"),
+     State("init-input-existing-dataset-name", "value"),
+     State("init-select-existing-catalog", "value"),
+     State("init-select-existing-schema", "value"),
+     State("init-select-existing-table", "value"),
+     State("init-select-existing-business-key", "value"),
+     State("init-input-existing-target-table", "value"),
+     State("init-input-existing-description", "value")],
     prevent_initial_call=True,
 )
-def handle_add_project(open_click, cancel_click, submit_click, is_open, name, desc, owner, team_email, add_emails, notif_enabled, src_tbl, tgt_tbl, b_key, ds_name=None):
+def handle_add_project(
+    open_click, cancel_click, submit_click,
+    is_open, name, desc, owner, team_email, add_emails, notif_enabled,
+    reg_method, file_store,
+    up_ds_name, up_cat, up_sch, up_tbl, up_b_key, up_tgt, up_desc,
+    ex_ds_name, ex_cat, ex_sch, ex_tbl, ex_b_key, ex_tgt, ex_desc
+):
     trig = ctx.triggered_id
     _ts = datetime.now().isoformat()
     if not trig or not _real_click():
         return (dash.no_update,) * 6
+
     if trig == "btn-open-add-project":
         return True, None, False, "", "info", dash.no_update
     elif trig == "btn-cancel-add-project":
         return False, None, False, "", "info", dash.no_update
     elif trig == "btn-submit-add-project":
-        is_notif_enabled = bool("enabled" in (notif_enabled or []))
-        res = db_adapter.add_new_project_with_dataset(
-            project_name=name,
-            description=desc or "",
-            owner=owner or "Data Engineering Team",
-            domain=None,
-            dataset_name=ds_name,
-            source_table=src_tbl or "",
-            target_table=tgt_tbl or src_tbl,
-            business_key=b_key or "id",
-            project_team_email=team_email or "",
-            additional_emails=add_emails or "",
-            notification_enabled=is_notif_enabled,
-            user="admin"
-        )
-        if res["success"]:
-            success_content = dbc.Alert([
-                html.Div([
-                    html.I(className="bi bi-check-circle-fill me-2 text-success fs-5"),
-                    html.Span("Project Registered Successfully!", className="fw-bold fs-6"),
-                ], className="d-flex align-items-center mb-2"),
-                html.P(f"Project '{res['project_name']}' (ID: {res['project_id']}) and dataset '{res['dataset_name']}' (ID: {res['dataset_id']}) are now active.", className="small mb-3"),
-                dbc.Button([
-                    html.I(className="bi bi-arrow-right-circle me-1"),
-                    "Configure DQ Rules"
-                ], href="/rules", color="success", size="sm", className="rounded-pill px-3 fw-semibold"),
-            ], color="success", className="mb-0")
-            # Close modal, show success, refresh table
-            return False, success_content, True, f"Project '{name}' registered successfully!", "success", _ts
+        is_notif = bool("enabled" in (notif_enabled or []))
+
+        # Atomic Registration via Option 1 (Upload)
+        if reg_method == "upload":
+            if not file_store or not file_store.get("contents"):
+                err = dbc.Alert("Please select or drop an initial dataset file (CSV, JSON, Parquet, Excel).", color="danger", className="py-2 mb-0")
+                return True, err, False, "", "info", dash.no_update
+
+            res = db_adapter.create_project_with_initial_upload(
+                project_name=name or "",
+                description=desc or "",
+                owner=owner or "Data Engineering Team",
+                domain=None,
+                project_team_email=team_email or "",
+                additional_emails=add_emails or "",
+                notification_enabled=is_notif,
+                contents=file_store["contents"],
+                filename=file_store.get("filename", "dataset.csv"),
+                dataset_name=up_ds_name or "",
+                catalog=up_cat or "hospital_catalog",
+                schema=up_sch or "healthcare",
+                table_name=up_tbl or "",
+                business_key=up_b_key or "id",
+                target_table=up_tgt,
+                dataset_description=up_desc or "",
+                user="admin"
+            )
+
+        # Atomic Registration via Option 2 (Existing UC Table)
         else:
-            err_msg = res.get("error") or res.get("message") or "Registration failed."
+            res = db_adapter.create_project_with_initial_existing(
+                project_name=name or "",
+                description=desc or "",
+                owner=owner or "Data Engineering Team",
+                domain=None,
+                project_team_email=team_email or "",
+                additional_emails=add_emails or "",
+                notification_enabled=is_notif,
+                dataset_name=ex_ds_name or ex_tbl or "",
+                catalog=ex_cat or "",
+                schema=ex_sch or "",
+                table_name=ex_tbl or "",
+                business_key=ex_b_key or "id",
+                target_table=ex_tgt,
+                dataset_description=ex_desc or "",
+                user="admin"
+            )
+
+        if res.get("success"):
+            p_name = res.get("project_name", name)
+            d_name = res.get("dataset_name", "")
+            toast_text = f"Project '{p_name}' and initial dataset '{d_name}' registered successfully!"
+            return False, None, True, toast_text, "success", _ts
+        else:
+            err_msg = res.get("message") or "Project and initial dataset creation failed."
             err_content = dbc.Alert([
                 html.I(className="bi bi-exclamation-triangle-fill me-2"),
                 err_msg
             ], color="danger", className="small py-2 mb-0")
             return True, err_content, False, "", "info", dash.no_update
+
     return is_open, None, False, "", "info", dash.no_update
 
 # 4. View Project Details Action
@@ -4422,12 +4730,11 @@ def refresh_management_table(_refresh_ts, search_term, status_filter):
      Output("upload-file-store", "data"),
      Output("upload-submit-alert", "children"),
      Output("existing-submit-alert", "children")],
-    [Input({"type": "btn-open-add-ds", "id": dash.ALL}, "n_clicks"),
-     Input("btn-open-register-dataset", "n_clicks"),
+    [Input("btn-open-register-dataset", "n_clicks"),
      Input("btn-cancel-add-dataset", "n_clicks")],
     prevent_initial_call=True,
 )
-def handle_open_add_dataset(open_clicks, top_open_clicks, cancel_clicks):
+def handle_open_add_dataset(top_open_clicks, cancel_clicks):
     trig = ctx.triggered_id
     if not trig or not _real_click():
         return (dash.no_update,) * 10
@@ -4440,10 +4747,6 @@ def handle_open_add_dataset(open_clicks, top_open_clicks, cancel_clicks):
         projects_df = db_adapter.get_projects_list()
         default_pid = int(projects_df.iloc[0]["project_id"]) if not projects_df.empty else 1
         return True, default_pid, default_pid, {"display": "block"}, {"display": "none"}, None, None, None, None, None
-
-    if isinstance(trig, dict) and trig.get("type") == "btn-open-add-ds":
-        p_id = int(trig["id"])
-        return True, p_id, p_id, {"display": "block"}, {"display": "none"}, None, None, None, None, None
 
     return (dash.no_update,) * 10
 
@@ -5522,13 +5825,12 @@ def handle_sched_freq_inputs(freq):
      State("sched-input-weekdays", "value"),
      State("sched-input-cron", "value"),
      State("sched-input-end-date", "value"),
-     State("sched-select-concurrency", "value"),
      State("exec-rules-mode", "value"),
      State("exec-rules-checklist", "value")],
     prevent_initial_call=True,
 )
 def handle_save_schedule(n_clicks, s_name, proj, ds, freq, tz, s_date, s_time,
-                         rep_int, weekdays, cron_expr, e_date, concurrency,
+                         rep_int, weekdays, cron_expr, e_date,
                          rules_mode, selected_rules):
     if not _real_click() or not proj or not ds:
         return dash.no_update, dash.no_update
@@ -5547,7 +5849,7 @@ def handle_save_schedule(n_clicks, s_name, proj, ds, freq, tz, s_date, s_time,
             "weekdays": w_days_str,
             "cron_expression": cron_expr,
             "end_date": e_date,
-            "concurrency_policy": concurrency or "SKIP",
+            "concurrency_policy": "PARALLEL",
             "rules_mode": rules_mode or "ALL",
             "selected_rules": selected_rules if rules_mode == "SELECTED" else None,
         }
@@ -5599,7 +5901,7 @@ def handle_schedules_table_actions(refresh_clicks, st_filter, proj, auto_tick, r
                 "_started_ts": time.time()
             }
             rows = _render_schedules_table(project_name=proj, status=st_filter)
-            hist = _render_history_table(project_name=proj)
+            hist = _render_history_table()
             return rows, new_store, False, True, False, hist
         elif action_type == "btn-sched-toggle-status":
             current_st = trig.get("status")
@@ -5611,7 +5913,7 @@ def handle_schedules_table_actions(refresh_clicks, st_filter, proj, auto_tick, r
             db_adapter.delete_schedule(sid, user="admin")
 
     rows = _render_schedules_table(project_name=proj, status=st_filter)
-    hist = _render_history_table(project_name=proj)
+    hist = _render_history_table()
     return rows, dash.no_update, dash.no_update, dash.no_update, dash.no_update, hist
 
 
@@ -5703,7 +6005,7 @@ def handle_run_validation(n_clicks, proj, ds, rules_mode, selected_rules):
     score_disp = f"{dq_score:.1f}%" if total_rules > 0 else "N/A"
 
     try:
-        hist_rows = _render_history_table(project_name=proj, dataset_name=ds)
+        hist_rows = _render_history_table()
     except Exception:
         hist_rows = dash.no_update
 
@@ -5876,7 +6178,7 @@ def poll_execution_progress(n_intervals, store):
         btn_disabled  = False
         btn_cancel_off = True
         try:
-            hist_rows = _render_history_table(project_name=proj, dataset_name=ds)
+            hist_rows = _render_history_table()
         except Exception as e:
             logger.error(f"Error rendering history table: {e}")
             hist_rows = dash.no_update
@@ -5907,17 +6209,16 @@ def poll_execution_progress(n_intervals, store):
 # Callback E4: Load / Filter history table
 @app.callback(
     Output("exec-history-table-body", "children"),
-    [Input("exec-select-project", "value"),
-     Input("exec-select-dataset", "value"),
+    [Input("exec-hist-filter-project", "value"),
      Input("exec-hist-filter-trigger", "value"),
      Input("exec-hist-filter-status", "value"),
      Input("exec-hist-search", "value")],
     prevent_initial_call=False,
 )
-def update_exec_history_table(proj, ds, trig, st, search):
+def update_exec_history_table(proj, trig, st, search):
     return _render_history_table(
         project_name=proj,
-        dataset_name=ds,
+        dataset_name=None,
         trigger_type=trig,
         status_filter=st,
         search=search
@@ -5985,7 +6286,7 @@ def handle_exec_history_row_actions(det_clicks, retry_clicks, csv_clicks,
                 "start_time": res.get("start_time"),
                 "_started_ts": time.time()
             }
-            hist_rows = _render_history_table(project_name=proj, dataset_name=ds)
+            hist_rows = _render_history_table()
             return False, dash.no_update, dash.no_update, dash.no_update, dash.no_update, new_store, False, True, False, hist_rows
 
         # Download CSV

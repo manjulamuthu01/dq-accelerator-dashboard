@@ -900,9 +900,8 @@ class DatabricksConnectionManager:
             elif c_low.endswith("_number") or c_low.endswith("_no") or c_low.endswith("_code"):
                 candidates.append(col)
 
-        for col in columns:
-            if col not in candidates:
-                candidates.append(col)
+        if not candidates and columns:
+            candidates.append(columns[0])
         return candidates
 
     def _generate_sample_preview_rows(self, columns: List[str], schema_info: List[Dict[str, Any]], table_name: str) -> List[Dict[str, Any]]:

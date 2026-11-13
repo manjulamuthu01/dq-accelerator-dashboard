@@ -1818,8 +1818,9 @@ def add_new_project_with_dataset(
     """, (p_id, ds_final_name, src_cat, src_sch, src_tbl, tgt_cat, tgt_sch, tgt_tbl, b_key, 1 if active else 0, now, now))
 
     if not ds_success:
+        execute_cmd("DELETE FROM dq_project_config WHERE project_id = ?", (p_id,))
         err = get_last_db_error()
-        msg = f"Project created, but failed to register dataset: {err}" if err else "Project created, but failed to register dataset in dq_table_config."
+        msg = f"Dataset registration failed: {err}" if err else "Failed to register initial dataset in dq_table_config. Project rolled back."
         return {"success": False, "message": msg}
 
     d_row = query_df("SELECT dataset_id FROM dq_table_config WHERE project_id = ? AND dataset_name = ?", (p_id, ds_final_name))
@@ -1855,6 +1856,247 @@ def add_new_project_with_dataset(
         "project_name": p_name,
         "dataset_name": ds_final_name,
         "message": f"Project '{p_name}' and dataset '{ds_final_name}' registered successfully."
+    }
+
+
+def create_project_with_initial_upload(
+    project_name: str,
+    description: str,
+    owner: str,
+    domain: Optional[str] = None,
+    project_team_email: str = "",
+    additional_emails: Optional[str] = None,
+    notification_enabled: bool = True,
+    contents: str = "",
+    filename: str = "",
+    dataset_name: str = "",
+    catalog: str = "hospital_catalog",
+    schema: str = "healthcare",
+    table_name: str = "",
+    business_key: str = "",
+    target_table: Optional[str] = None,
+    dataset_description: str = "",
+    user: str = "admin"
+) -> Dict[str, Any]:
+    """
+    Atomically creates a new project and onboards its required initial dataset via file upload:
+    1. Validates project name, emails, and mandatory initial dataset file
+    2. Inserts project record into dq_project_config
+    3. Calls register_uploaded_dataset with the new project_id
+    4. If dataset registration fails, rolls back the project record immediately
+    5. Returns unified success response
+    """
+    p_name = (project_name or "").strip()
+    if not p_name:
+        return {"success": False, "message": "Project Name is required."}
+
+    team_email = (project_team_email or "").strip()
+    if not team_email:
+        return {"success": False, "message": "Project Team Email Address is mandatory."}
+
+    valid_t, clean_t, err_t = email_service.parse_and_validate_emails(team_email)
+    if not valid_t or not clean_t:
+        return {"success": False, "message": f"Invalid Project Team Email Address: {err_t}"}
+
+    clean_addl = []
+    if additional_emails and str(additional_emails).strip():
+        valid_a, clean_addl, err_a = email_service.parse_and_validate_emails(str(additional_emails).strip())
+        if not valid_a:
+            return {"success": False, "message": f"Invalid Additional Notification Emails: {err_a}"}
+
+    if not contents or not filename:
+        return {"success": False, "message": "An initial dataset file (CSV, JSON, Parquet, or Excel) must be uploaded."}
+    ds_name = (dataset_name or "").strip()
+    tbl_name = (table_name or "").strip()
+    if not ds_name or not tbl_name:
+        return {"success": False, "message": "Dataset Name and Destination Table Name are required."}
+
+    existing = query_df("SELECT project_id FROM dq_project_config WHERE LOWER(project_name) = LOWER(?)", (p_name,))
+    if not existing.empty:
+        return {"success": False, "message": f"Project '{p_name}' already exists. Please choose a unique name."}
+
+    all_notif_emails = ", ".join(clean_t + clean_addl)
+    p_owner = (owner or "").strip() or "Data Engineering Team"
+    p_dom = (domain or "").strip() or None
+    desc = (description or "").strip()
+    cat = (catalog or "hospital_catalog").strip()
+    sch = (schema or "healthcare").strip()
+    now = datetime.datetime.now().strftime("%d %b %Y, %I:%M %p")
+
+    proj_success = execute_cmd("""
+    INSERT INTO dq_project_config (project_name, description, owner, business_domain, catalog_name, schema_name, active, project_team_email, additional_emails, notification_emails, notification_enabled, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+    """, (p_name, desc, p_owner, p_dom, cat, sch, clean_t[0], ", ".join(clean_addl), all_notif_emails, 1 if notification_enabled else 0, now, now))
+
+    if not proj_success:
+        return {"success": False, "message": "Failed to create project record."}
+
+    p_row = query_df("SELECT project_id FROM dq_project_config WHERE project_name = ?", (p_name,))
+    if p_row.empty:
+        return {"success": False, "message": "Could not confirm created project."}
+    p_id = int(p_row.iloc[0]["project_id"])
+
+    ds_res = register_uploaded_dataset(
+        project_id=p_id,
+        dataset_name=ds_name,
+        contents=contents,
+        filename=filename,
+        catalog=cat,
+        schema=sch,
+        table_name=tbl_name,
+        business_key=(business_key or "").strip(),
+        target_table=target_table,
+        description=dataset_description,
+        user=user
+    )
+
+    if not ds_res.get("success"):
+        execute_cmd("DELETE FROM dq_project_config WHERE project_id = ?", (p_id,))
+        err_detail = ds_res.get("message") or "Initial dataset registration failed."
+        return {"success": False, "message": f"Project creation rolled back: {err_detail}"}
+
+    log_config_audit(
+        entity_type="PROJECT",
+        entity_id=p_name,
+        action="CREATE",
+        old_value=None,
+        new_value={
+            "project_id": p_id,
+            "dataset_id": ds_res.get("dataset_id"),
+            "dataset_name": ds_name,
+            "description": desc,
+            "owner": p_owner,
+            "team_email": clean_t[0],
+            "method": "UPLOAD"
+        },
+        changed_by=user,
+    )
+
+    return {
+        "success": True,
+        "project_id": p_id,
+        "project_name": p_name,
+        "dataset_id": ds_res.get("dataset_id"),
+        "dataset_name": ds_name,
+        "message": "Project and initial dataset registered successfully."
+    }
+
+
+def create_project_with_initial_existing(
+    project_name: str,
+    description: str,
+    owner: str,
+    domain: Optional[str] = None,
+    project_team_email: str = "",
+    additional_emails: Optional[str] = None,
+    notification_enabled: bool = True,
+    dataset_name: str = "",
+    catalog: str = "",
+    schema: str = "",
+    table_name: str = "",
+    business_key: str = "id",
+    target_table: Optional[str] = None,
+    dataset_description: str = "",
+    user: str = "admin"
+) -> Dict[str, Any]:
+    """
+    Atomically creates a new project and onboards its required initial dataset via existing Unity Catalog table:
+    1. Validates project name, emails, and mandatory existing table selection
+    2. Inserts project record into dq_project_config
+    3. Calls register_existing_table with the new project_id
+    4. If dataset registration fails, rolls back the project record immediately
+    5. Returns unified success response
+    """
+    p_name = (project_name or "").strip()
+    if not p_name:
+        return {"success": False, "message": "Project Name is required."}
+
+    team_email = (project_team_email or "").strip()
+    if not team_email:
+        return {"success": False, "message": "Project Team Email Address is mandatory."}
+
+    valid_t, clean_t, err_t = email_service.parse_and_validate_emails(team_email)
+    if not valid_t or not clean_t:
+        return {"success": False, "message": f"Invalid Project Team Email Address: {err_t}"}
+
+    clean_addl = []
+    if additional_emails and str(additional_emails).strip():
+        valid_a, clean_addl, err_a = email_service.parse_and_validate_emails(str(additional_emails).strip())
+        if not valid_a:
+            return {"success": False, "message": f"Invalid Additional Notification Emails: {err_a}"}
+
+    ds_name = (dataset_name or "").strip()
+    cat = (catalog or "").strip()
+    sch = (schema or "").strip()
+    tbl = (table_name or "").strip()
+    if not ds_name or not cat or not sch or not tbl:
+        return {"success": False, "message": "Dataset Name, Catalog, Schema, and Existing Table Name are required."}
+
+    existing = query_df("SELECT project_id FROM dq_project_config WHERE LOWER(project_name) = LOWER(?)", (p_name,))
+    if not existing.empty:
+        return {"success": False, "message": f"Project '{p_name}' already exists. Please choose a unique name."}
+
+    all_notif_emails = ", ".join(clean_t + clean_addl)
+    p_owner = (owner or "").strip() or "Data Engineering Team"
+    p_dom = (domain or "").strip() or None
+    desc = (description or "").strip()
+    now = datetime.datetime.now().strftime("%d %b %Y, %I:%M %p")
+
+    proj_success = execute_cmd("""
+    INSERT INTO dq_project_config (project_name, description, owner, business_domain, catalog_name, schema_name, active, project_team_email, additional_emails, notification_emails, notification_enabled, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+    """, (p_name, desc, p_owner, p_dom, cat, sch, clean_t[0], ", ".join(clean_addl), all_notif_emails, 1 if notification_enabled else 0, now, now))
+
+    if not proj_success:
+        return {"success": False, "message": "Failed to create project record."}
+
+    p_row = query_df("SELECT project_id FROM dq_project_config WHERE project_name = ?", (p_name,))
+    if p_row.empty:
+        return {"success": False, "message": "Could not confirm created project."}
+    p_id = int(p_row.iloc[0]["project_id"])
+
+    ds_res = register_existing_table(
+        project_id=p_id,
+        dataset_name=ds_name,
+        catalog=cat,
+        schema=sch,
+        table_name=tbl,
+        business_key=(business_key or "id").strip(),
+        target_table=target_table,
+        description=dataset_description,
+        user=user
+    )
+
+    if not ds_res.get("success"):
+        execute_cmd("DELETE FROM dq_project_config WHERE project_id = ?", (p_id,))
+        err_detail = ds_res.get("message") or "Initial dataset registration failed."
+        return {"success": False, "message": f"Project creation rolled back: {err_detail}"}
+
+    log_config_audit(
+        entity_type="PROJECT",
+        entity_id=p_name,
+        action="CREATE",
+        old_value=None,
+        new_value={
+            "project_id": p_id,
+            "dataset_id": ds_res.get("dataset_id"),
+            "dataset_name": ds_name,
+            "description": desc,
+            "owner": p_owner,
+            "team_email": clean_t[0],
+            "method": "EXISTING_TABLE",
+            "source_table": f"{cat}.{sch}.{tbl}"
+        },
+        changed_by=user,
+    )
+
+    return {
+        "success": True,
+        "project_id": p_id,
+        "project_name": p_name,
+        "dataset_id": ds_res.get("dataset_id"),
+        "dataset_name": ds_name,
+        "message": "Project and initial dataset registered successfully."
     }
 
 def get_project_details(project_id: int) -> Dict[str, Any]:

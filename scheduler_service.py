@@ -358,34 +358,7 @@ class DQSchedulerService:
             rules_mode = str(s.get("rules_mode") or "ALL")
             selected_rules = str(s.get("selected_rules") or "")
 
-            # Check if an execution is currently running for this project/dataset
-            running_df = db_adapter.query_df("""
-                SELECT execution_id FROM dq_execution_summary
-                WHERE project_name = ? AND dataset_name = ? AND (overall_status = 'RUNNING' OR dq_status = 'RUNNING')
-            """, (proj_name, ds_name))
-
-            if not running_df.empty and concurrency_policy == "SKIP":
-                logger.warning(f"Skipping scheduled execution '{sched_name}' because run is already in progress.")
-                # Advance next run without firing
-                next_run = calculate_next_run(
-                    frequency=s["frequency"],
-                    start_date=s["start_date"],
-                    start_time=s["start_time"],
-                    weekdays=s.get("weekdays"),
-                    day_of_month=s.get("day_of_month"),
-                    repeat_interval=s.get("repeat_interval", 1),
-                    cron_expression=s.get("cron_expression"),
-                    end_date=s.get("end_date"),
-                    timezone_str=s.get("timezone", "UTC"),
-                    after_dt=now_dt
-                )
-                db_adapter.execute_cmd(
-                    "UPDATE dq_schedules SET next_run_at = ?, updated_at = ? WHERE schedule_id = ?",
-                    (next_run, now_str, sched_id)
-                )
-                continue
-
-            # Calculate next execution time before or alongside launch
+            # Calculate next execution time before launch
             next_run = calculate_next_run(
                 frequency=s["frequency"],
                 start_date=s["start_date"],

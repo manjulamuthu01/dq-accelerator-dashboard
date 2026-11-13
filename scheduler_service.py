@@ -83,6 +83,13 @@ def calculate_next_run(
 
     freq_upper = (frequency or "DAILY").strip().upper()
 
+    # For recurring schedules, if end_date was set on or before start_date, ignore it as an accidental constraint
+    if freq_upper != "ONCE" and end_date and str(end_date).strip():
+        e_check = parse_datetime_safe(end_date)
+        s_check = parse_datetime_safe(start_date)
+        if e_check and s_check and e_check.date() <= s_check.date():
+            end_date = None
+
     # 1. ONCE
     if freq_upper == "ONCE":
         s_dt = parse_datetime_safe(f"{start_date} {start_time}")

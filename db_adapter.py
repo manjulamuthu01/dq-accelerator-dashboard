@@ -19,11 +19,14 @@ import pandas as pd
 import time
 import threading
 import concurrent.futures
+import logging
 from typing import Optional, Dict, Any, List, Union, Tuple
 from rule_engine import RULE_TEMPLATES, render_sql
 import unity_catalog_service as ucs
 import email_service
 import scheduler_service
+
+logger = logging.getLogger("db_adapter")
 
 # Global execution cancellation tracking dictionary: execution_id -> threading.Event()
 _ACTIVE_CANCELLATION_EVENTS: Dict[str, threading.Event] = {}

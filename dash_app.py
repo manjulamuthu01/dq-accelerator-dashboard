@@ -409,6 +409,56 @@ app.index_string = """<!DOCTYPE html>
             width: 35% !important;
             max-width: 35% !important;
         }
+        /* Configuration Audit Log Table & Card Fixes */
+        .config-audit-table-wrapper {
+            width: 100% !important;
+            max-width: 100% !important;
+            min-width: 0 !important;
+            overflow-x: auto !important;
+            box-sizing: border-box !important;
+            -webkit-overflow-scrolling: touch;
+        }
+        .config-audit-table {
+            width: 100% !important;
+            max-width: 100% !important;
+            table-layout: fixed !important;
+            box-sizing: border-box !important;
+            border-collapse: collapse !important;
+            margin-bottom: 0 !important;
+        }
+        .config-audit-table th,
+        .config-audit-table td {
+            box-sizing: border-box !important;
+            white-space: normal !important;
+            overflow-wrap: anywhere !important;
+            word-break: break-word !important;
+            vertical-align: middle !important;
+        }
+        .config-audit-table th:nth-child(1),
+        .config-audit-table td:nth-child(1) {
+            width: 18% !important;
+            max-width: 18% !important;
+        }
+        .config-audit-table th:nth-child(2),
+        .config-audit-table td:nth-child(2) {
+            width: 16% !important;
+            max-width: 16% !important;
+        }
+        .config-audit-table th:nth-child(3),
+        .config-audit-table td:nth-child(3) {
+            width: 34% !important;
+            max-width: 34% !important;
+        }
+        .config-audit-table th:nth-child(4),
+        .config-audit-table td:nth-child(4) {
+            width: 16% !important;
+            max-width: 16% !important;
+        }
+        .config-audit-table th:nth-child(5),
+        .config-audit-table td:nth-child(5) {
+            width: 16% !important;
+            max-width: 16% !important;
+        }
         /* Stepper Pipeline */
         .stepper-container {
             display: flex;
@@ -3510,16 +3560,90 @@ def page_audit():
     config_rows = []
     for _, c in config_audits.iterrows():
         act = str(c["action"])
-        act_badge = "badge-pass" if act == "CREATE" else ("badge-error" if act == "TOGGLE_STATUS" else "badge-fail")
+        act_badge = "badge-pass" if act in ("CREATE", "RUN") else ("badge-error" if act == "TOGGLE_STATUS" else "badge-fail")
+        new_val = str(c.get("new_value") or "")
+        old_val = str(c.get("old_value") or "")
+        tip_parts = []
+        if old_val and old_val != "nan":
+            tip_parts.append(f"Old: {old_val}")
+        if new_val and new_val != "nan":
+            tip_parts.append(f"New: {new_val}")
+        action_title = " | ".join(tip_parts) if tip_parts else f"Action: {act}"
+
         config_rows.append(html.Tr([
-            html.Td(c["timestamp"]),
-            html.Td(html.Span(c["entity_type"], style={"fontWeight": "600", "color": "#475569"})),
-            html.Td(c["entity_id"], style={"fontWeight": "600"}),
-            html.Td(html.Span(act, className=act_badge)),
-            html.Td(c["changed_by"]),
-            html.Td(html.Code(str(c["old_value"] or "—")[:40] + ("..." if len(str(c["old_value"] or "")) > 40 else ""), style={"fontSize": "0.75rem"})),
-            html.Td(html.Code(str(c["new_value"] or "—")[:40] + ("..." if len(str(c["new_value"] or "")) > 40 else ""), style={"fontSize": "0.75rem"})),
+            html.Td(
+                str(c.get("timestamp", "—")),
+                style={
+                    "width": "18%",
+                    "maxWidth": "18%",
+                    "fontSize": "0.82rem",
+                    "whiteSpace": "normal",
+                    "overflowWrap": "anywhere",
+                    "wordBreak": "break-word",
+                    "boxSizing": "border-box",
+                    "verticalAlign": "middle",
+                    "padding": "10px 12px",
+                }
+            ),
+            html.Td(
+                html.Span(str(c.get("entity_type", "—")), style={"fontWeight": "600", "color": "#475569"}),
+                style={
+                    "width": "16%",
+                    "maxWidth": "16%",
+                    "fontSize": "0.82rem",
+                    "whiteSpace": "normal",
+                    "overflowWrap": "anywhere",
+                    "wordBreak": "break-word",
+                    "boxSizing": "border-box",
+                    "verticalAlign": "middle",
+                    "padding": "10px 12px",
+                }
+            ),
+            html.Td(
+                html.Span(str(c.get("entity_id", "—")), style={"fontWeight": "600", "color": "#0F172A"}),
+                style={
+                    "width": "34%",
+                    "maxWidth": "34%",
+                    "fontSize": "0.82rem",
+                    "whiteSpace": "normal",
+                    "overflowWrap": "anywhere",
+                    "wordBreak": "break-word",
+                    "boxSizing": "border-box",
+                    "verticalAlign": "middle",
+                    "padding": "10px 12px",
+                }
+            ),
+            html.Td(
+                html.Span(act, className=act_badge, title=action_title, style={"whiteSpace": "normal", "overflowWrap": "anywhere", "wordBreak": "break-word", "display": "inline-block", "maxWidth": "100%", "textAlign": "center"}),
+                style={
+                    "width": "16%",
+                    "maxWidth": "16%",
+                    "fontSize": "0.82rem",
+                    "whiteSpace": "normal",
+                    "overflowWrap": "anywhere",
+                    "wordBreak": "break-word",
+                    "boxSizing": "border-box",
+                    "verticalAlign": "middle",
+                    "padding": "10px 12px",
+                }
+            ),
+            html.Td(
+                html.Span(str(c.get("changed_by", "—")), className="badge bg-light text-dark border", style={"fontSize": "0.8rem", "fontWeight": "600", "whiteSpace": "normal", "overflowWrap": "anywhere", "wordBreak": "break-word", "display": "inline-block", "maxWidth": "100%"}),
+                style={
+                    "width": "16%",
+                    "maxWidth": "16%",
+                    "fontSize": "0.82rem",
+                    "whiteSpace": "normal",
+                    "overflowWrap": "anywhere",
+                    "wordBreak": "break-word",
+                    "boxSizing": "border-box",
+                    "verticalAlign": "middle",
+                    "padding": "10px 12px",
+                }
+            ),
         ]))
+    if not config_rows:
+        config_rows = [html.Tr([html.Td("No configuration change records found.", colSpan=5, className="text-center text-muted", style={"padding": "16px"})])]
 
     # Databricks Job run rows (Phase 7)
     job_runs = db_adapter.get_job_runs(limit=20)
@@ -3593,19 +3717,28 @@ def page_audit():
                         html.Span("Tracks all project, dataset, and rule changes", className="text-muted small"),
                     ], className="dq-card-title"),
 
-                    html.Table([
-                        html.Thead(html.Tr([
-                            html.Th("Timestamp"),
-                            html.Th("Entity Type"),
-                            html.Th("Entity ID"),
-                            html.Th("Action"),
-                            html.Th("User"),
-                            html.Th("Old Value"),
-                            html.Th("New Value"),
-                        ])),
-                        html.Tbody(config_rows),
-                    ], className="clean-table"),
-                ], className="dq-card mt-3"),
+                    html.Div(
+                        html.Table([
+                            html.Colgroup([
+                                html.Col(style={"width": "18%"}),
+                                html.Col(style={"width": "16%"}),
+                                html.Col(style={"width": "34%"}),
+                                html.Col(style={"width": "16%"}),
+                                html.Col(style={"width": "16%"}),
+                            ]),
+                            html.Thead(html.Tr([
+                                html.Th("Timestamp", style={"width": "18%", "boxSizing": "border-box"}),
+                                html.Th("Entity Type", style={"width": "16%", "boxSizing": "border-box"}),
+                                html.Th("Entity ID", style={"width": "34%", "boxSizing": "border-box"}),
+                                html.Th("Action", style={"width": "16%", "boxSizing": "border-box"}),
+                                html.Th("User", style={"width": "16%", "boxSizing": "border-box"}),
+                            ])),
+                            html.Tbody(config_rows),
+                        ], className="clean-table config-audit-table", style={"width": "100%", "maxWidth": "100%", "tableLayout": "fixed", "boxSizing": "border-box"}),
+                        className="config-audit-table-wrapper",
+                        style={"width": "100%", "maxWidth": "100%", "minWidth": "0", "overflowX": "auto", "boxSizing": "border-box"}
+                    ),
+                ], className="dq-card mt-3", style={"width": "100%", "minWidth": "0", "boxSizing": "border-box"}),
             ], label="Configuration Changes", tab_id="tab-config"),
 
             # TAB 3: Databricks Workflow Runs (Phase 7)
